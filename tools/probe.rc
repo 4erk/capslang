@@ -12,11 +12,11 @@ BEGIN
  BEGIN
   BLOCK "040904B0"
   BEGIN
-   VALUE "FileDescription", "CapsLang feasibility probe (not a release candidate)\0"
-   VALUE "FileVersion", "1.1.0-gate1\0"
-   VALUE "ProductName", "CapsLang Probe\0"
-   VALUE "PrivateBuild", "Feasibility checks only\0"
-   VALUE "OriginalFilename", "CapsLangProbe.exe\0"
+   VALUE "FileDescription", "CapsLang read-only inventory (not a release candidate)\0"
+   VALUE "FileVersion", "1.1.0-inventory\0"
+   VALUE "ProductName", "CapsLang Inventory\0"
+   VALUE "PrivateBuild", "Read-only inventory; interactive probe retired\0"
+   VALUE "OriginalFilename", "CapsLangInventory.exe\0"
   END
  END
  BLOCK "VarFileInfo"

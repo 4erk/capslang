@@ -2,16 +2,26 @@
 param(
     [switch]$SkipTests,
     [switch]$Clean,
-    [switch]$ProbeOnly
+    [switch]$ProbeOnly,
+    [switch]$IntegrationOnly
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+if ($ProbeOnly -and $IntegrationOnly) { throw 'Choose either -ProbeOnly or -IntegrationOnly.' }
+# Some WSL hosts inherit PATHEXT=.CPL. PowerShell then fails to wait for .exe
+# invocations or set LASTEXITCODE. Repair only this build process, and restore
+# the caller's environment even on failure or an early return.
+$originalPathExt = $env:PATHEXT
+try {
+if (($env:PATHEXT -split ';') -notcontains '.EXE') { $env:PATHEXT = $env:PATHEXT + ';.EXE' }
+
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $buildDir = Join-Path $projectRoot 'build'
 $distDir = Join-Path $projectRoot 'dist'
 $probeDir = Join-Path $buildDir 'probe'
+$integrationDir = Join-Path $buildDir 'integration'
 $toolRoot = Join-Path $env:LOCALAPPDATA 'CapsLangBuildCache'
 $toolVersion = '20260616'
 $archiveName = "llvm-mingw-$toolVersion-ucrt-x86_64.zip"
@@ -21,7 +31,9 @@ $downloadUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$toolVe
 $expectedSha256 = 'b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35'
 
 if ($Clean) {
-    if ($ProbeOnly) {
+    if ($IntegrationOnly) {
+        Remove-Item -LiteralPath $integrationDir -Recurse -Force -ErrorAction SilentlyContinue
+    } elseif ($ProbeOnly) {
         Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
     } else {
         Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -58,6 +70,37 @@ if (-not (Test-Path -LiteralPath $windres)) {
     throw "Resource compiler not found after extraction: $windres"
 }
 
+if ($IntegrationOnly) {
+    New-Item -ItemType Directory -Force -Path $integrationDir | Out-Null
+    $integrationExe = Join-Path $integrationDir 'windows_layout_integration.exe'
+    & $compiler '-std=c++17' '-O2' '-DNDEBUG' '-D_WIN32_WINNT=0x0A00' '-DWINVER=0x0A00' `
+        '-static' '-static-libgcc' '-static-libstdc++' '-Wall' '-Wextra' '-Wpedantic' '-Werror' `
+        '-Wl,--no-insert-timestamp' '-municode' (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') `
+        (Join-Path $projectRoot 'src\platform\windows_support.cpp') '-o' $integrationExe `
+        '-lole32' '-luuid' '-luser32' '-ladvapi32' '-lsetupapi'
+    if ($LASTEXITCODE -ne 0) { throw 'Integration test compilation failed.' }
+    $test = New-Object System.Diagnostics.Process
+    $test.StartInfo.FileName = $integrationExe
+    $test.StartInfo.UseShellExecute = $false
+    $test.StartInfo.CreateNoWindow = $true
+    $test.StartInfo.RedirectStandardOutput = $true
+    $test.StartInfo.RedirectStandardError = $true
+    try {
+        if (-not $test.Start()) { throw 'Cannot start Windows integration tests.' }
+        $stdoutTask = $test.StandardOutput.ReadToEndAsync()
+        $stderrTask = $test.StandardError.ReadToEndAsync()
+        if (-not $test.WaitForExit(30000)) {
+            $test.Kill() # Exact child test process; its job reaps only its fixtures.
+            $test.WaitForExit()
+            throw 'Windows integration tests exceeded 30 seconds.'
+        }
+        Write-Host $stdoutTask.Result
+        if ($stderrTask.Result) { Write-Host $stderrTask.Result }
+        if ($test.ExitCode -ne 0) { throw 'Windows integration tests failed.' }
+    } finally { $test.Dispose() }
+    return
+}
+
 if ($ProbeOnly) {
     New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
     $probeArgs = @(
@@ -82,12 +125,12 @@ if ($ProbeOnly) {
     $probeResource = Join-Path $probeDir 'probe.res'
     & $windres (Join-Path $projectRoot 'tools\probe.rc') '-I' (Join-Path $projectRoot 'tools') '-O' 'coff' '-o' $probeResource
     if ($LASTEXITCODE -ne 0) { throw 'Probe resource compilation failed.' }
-    $probeExe = Join-Path $probeDir 'CapsLangProbe.exe'
+    $probeExe = Join-Path $probeDir 'CapsLangInventory.exe'
     & $compiler @probeArgs '-municode' '-mwindows' (Join-Path $projectRoot 'tools\capslang_probe.cpp') `
         (Join-Path $projectRoot 'src\platform\windows_support.cpp') $probeResource '-o' $probeExe `
         '-lole32' '-luuid' '-luser32' '-ladvapi32' '-lsetupapi' '-lshell32' '-lcomdlg32'
     if ($LASTEXITCODE -ne 0) { throw 'Probe compilation failed.' }
-    Write-Host "Built feasibility probe (NOT a release candidate): $probeExe"
+    Write-Host "Built read-only inventory (NOT CapsLang or a release candidate): $probeExe"
     Write-Host "SHA256: $((Get-FileHash -LiteralPath $probeExe -Algorithm SHA256).Hash)"
     return
 }
@@ -126,3 +169,4 @@ $hash = (Get-FileHash -LiteralPath $appExe -Algorithm SHA256).Hash
 Write-Host "Built $($artifact.FullName)"
 Write-Host "Size: $($artifact.Length) bytes"
 Write-Host "SHA256: $hash"
+} finally { $env:PATHEXT = $originalPathExt }

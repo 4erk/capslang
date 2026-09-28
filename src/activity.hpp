@@ -2,9 +2,11 @@
 #include <cstdint>
 
 namespace capslang {
-// This decision runs AFTER CallNextHookEx. A forwarded event consumed by MWB
-// is not evidence that the source computer received the user's input.
-constexpr bool IsDeliveredActivity(bool actionable, bool ownEvent, bool consumedDownstream) {
+// A candidate is NOT evidence of genuine user activity or of the MWB recipient.
+// MWB SendMouse and its maintenance MoveMouse* can both produce unmarked,
+// injected events that CallNextHookEx passes. Never use this predicate alone
+// to update an authoritative last-activity timestamp or choose a peer's layout.
+constexpr bool IsUnconsumedInputCandidate(bool actionable, bool ownEvent, bool consumedDownstream) {
     return actionable && !ownEvent && !consumedDownstream;
 }
 

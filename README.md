@@ -29,9 +29,12 @@ Windows покажет предупреждение SmartScreen, потому ч
 ### Подготовка 1.1
 
 В ветке разработки сначала проверяются Windows API и совместимость с MWB.
-`./build.ps1 -ProbeOnly` собирает отдельный `build\probe\CapsLangProbe.exe`;
-он **не является новой версией или release candidate** и не меняет автозапуск.
-Порядок проверок: [проверка предпосылок](docs/1.1-feasibility.md).
+`./build.ps1 -IntegrationOnly` автоматически проверяет реальные межпроцессные
+переключения Windows на изолированном desktop, не трогая рабочие окна.
+`./build.ps1 -ProbeOnly` собирает только читающий `build\probe\CapsLangInventory.exe`.
+Прежняя интерактивная диагностика, останавливавшая CapsLang, отозвана.
+Это **не новая версия и не release candidate**.
+[Проверки и ограничения](docs/1.1-feasibility.md), [фактический статус](docs/1.1-status.md).
 
 ## Установка
 

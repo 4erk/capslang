@@ -2,3 +2,5 @@
 /dist/
 /.tools/
 *.log
+capslang-probe*.jsonl
+/capslang-win-space.exe.disabled

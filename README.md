@@ -26,6 +26,13 @@ Windows покажет предупреждение SmartScreen, потому ч
 `%LOCALAPPDATA%\CapsLangBuildCache`, проверяет SHA-256, запускает тесты и создаёт
 `dist\CapsLang.exe`. У готового EXE нет внешних runtime-зависимостей.
 
+### Подготовка 1.1
+
+В ветке разработки сначала проверяются Windows API и совместимость с MWB.
+`./build.ps1 -ProbeOnly` собирает отдельный `build\probe\CapsLangProbe.exe`;
+он **не является новой версией или release candidate** и не меняет автозапуск.
+Порядок проверок: [проверка предпосылок](docs/1.1-feasibility.md).
+
 ## Установка
 
 Запустите `dist\CapsLang.exe` двойным кликом и нажмите **Установить**. Программа:

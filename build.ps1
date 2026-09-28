@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [switch]$SkipTests,
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$ProbeOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,6 +11,7 @@ Set-StrictMode -Version Latest
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $buildDir = Join-Path $projectRoot 'build'
 $distDir = Join-Path $projectRoot 'dist'
+$probeDir = Join-Path $buildDir 'probe'
 $toolRoot = Join-Path $env:LOCALAPPDATA 'CapsLangBuildCache'
 $toolVersion = '20260616'
 $archiveName = "llvm-mingw-$toolVersion-ucrt-x86_64.zip"
@@ -19,8 +21,12 @@ $downloadUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$toolVe
 $expectedSha256 = 'b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35'
 
 if ($Clean) {
-    Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $distDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($ProbeOnly) {
+        Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $distDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $buildDir, $distDir, $toolRoot | Out-Null
@@ -50,6 +56,40 @@ if (-not (Test-Path -LiteralPath $compiler)) {
 }
 if (-not (Test-Path -LiteralPath $windres)) {
     throw "Resource compiler not found after extraction: $windres"
+}
+
+if ($ProbeOnly) {
+    New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+    $probeArgs = @(
+        '-std=c++17', '-O2', '-DNDEBUG', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00',
+        '-static', '-static-libgcc', '-static-libstdc++', '-Wall', '-Wextra', '-Wpedantic',
+        '-Werror', '-Wl,--no-insert-timestamp'
+    )
+    $probeTestExe = Join-Path $probeDir 'activity_tests.exe'
+    if (-not $SkipTests) {
+        & $compiler @probeArgs (Join-Path $projectRoot 'tests\activity_tests.cpp') '-o' $probeTestExe
+        if ($LASTEXITCODE -ne 0) { throw 'Probe test compilation failed.' }
+        & $probeTestExe
+        if ($LASTEXITCODE -ne 0) { throw 'Probe tests failed.' }
+        $platformTestExe = Join-Path $probeDir 'platform_tests.exe'
+        & $compiler @probeArgs (Join-Path $projectRoot 'tests\platform_tests.cpp') `
+            (Join-Path $projectRoot 'src\platform\windows_support.cpp') '-o' $platformTestExe `
+            '-lole32' '-luuid' '-luser32' '-ladvapi32' '-lsetupapi'
+        if ($LASTEXITCODE -ne 0) { throw 'Platform test compilation failed.' }
+        & $platformTestExe
+        if ($LASTEXITCODE -ne 0) { throw 'Platform tests failed.' }
+    }
+    $probeResource = Join-Path $probeDir 'probe.res'
+    & $windres (Join-Path $projectRoot 'tools\probe.rc') '-I' (Join-Path $projectRoot 'tools') '-O' 'coff' '-o' $probeResource
+    if ($LASTEXITCODE -ne 0) { throw 'Probe resource compilation failed.' }
+    $probeExe = Join-Path $probeDir 'CapsLangProbe.exe'
+    & $compiler @probeArgs '-municode' '-mwindows' (Join-Path $projectRoot 'tools\capslang_probe.cpp') `
+        (Join-Path $projectRoot 'src\platform\windows_support.cpp') $probeResource '-o' $probeExe `
+        '-lole32' '-luuid' '-luser32' '-ladvapi32' '-lsetupapi' '-lshell32' '-lcomdlg32'
+    if ($LASTEXITCODE -ne 0) { throw 'Probe compilation failed.' }
+    Write-Host "Built feasibility probe (NOT a release candidate): $probeExe"
+    Write-Host "SHA256: $((Get-FileHash -LiteralPath $probeExe -Algorithm SHA256).Hash)"
+    return
 }
 
 $source = Join-Path $projectRoot 'src\capslang.cpp'

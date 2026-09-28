@@ -3,13 +3,16 @@ param(
     [switch]$SkipTests,
     [switch]$Clean,
     [switch]$ProbeOnly,
-    [switch]$IntegrationOnly
+    [switch]$IntegrationOnly,
+    [switch]$RuntimeTestsOnly
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-if ($ProbeOnly -and $IntegrationOnly) { throw 'Choose either -ProbeOnly or -IntegrationOnly.' }
+if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly) | Where-Object { $_ }).Count -gt 1) {
+    throw 'Choose only one of -ProbeOnly, -IntegrationOnly, -RuntimeTestsOnly.'
+}
 # Some WSL hosts inherit PATHEXT=.CPL. PowerShell then fails to wait for .exe
 # invocations or set LASTEXITCODE. Repair only this build process, and restore
 # the caller's environment even on failure or an early return.
@@ -31,7 +34,7 @@ $downloadUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$toolVe
 $expectedSha256 = 'b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35'
 
 if ($Clean) {
-    if ($IntegrationOnly) {
+    if ($IntegrationOnly -or $RuntimeTestsOnly) {
         Remove-Item -LiteralPath $integrationDir -Recurse -Force -ErrorAction SilentlyContinue
     } elseif ($ProbeOnly) {
         Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -68,6 +71,64 @@ if (-not (Test-Path -LiteralPath $compiler)) {
 }
 if (-not (Test-Path -LiteralPath $windres)) {
     throw "Resource compiler not found after extraction: $windres"
+}
+
+if ($RuntimeTestsOnly) {
+    New-Item -ItemType Directory -Force -Path $integrationDir | Out-Null
+    $flags = @('-std=c++17', '-O2', '-DNDEBUG', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00',
+        '-static', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-Wl,--no-insert-timestamp')
+    $platform = Join-Path $projectRoot 'src\platform\windows_support.cpp'
+    $libs = @('-lole32', '-luuid', '-luser32', '-ladvapi32', '-lsetupapi')
+    function Invoke-BoundedTest([string]$Path) {
+        $test = New-Object System.Diagnostics.Process
+        $test.StartInfo.FileName = $Path
+        $test.StartInfo.UseShellExecute = $false
+        $test.StartInfo.CreateNoWindow = $true
+        $test.StartInfo.RedirectStandardOutput = $true
+        $test.StartInfo.RedirectStandardError = $true
+        try {
+            if (-not $test.Start()) { throw "Cannot start $Path" }
+            $stdoutTask = $test.StandardOutput.ReadToEndAsync()
+            $stderrTask = $test.StandardError.ReadToEndAsync()
+            if (-not $test.WaitForExit(45000)) {
+                $test.Kill()
+                $test.WaitForExit()
+                throw "Test exceeded 45 seconds: $Path"
+            }
+            Write-Host $stdoutTask.Result
+            if ($stderrTask.Result) { Write-Host $stderrTask.Result }
+            if ($test.ExitCode -ne 0) { throw "Test failed: $Path" }
+        } finally { $test.Dispose() }
+    }
+    $core = Join-Path $integrationDir 'core_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\core_tests.cpp') '-o' $core
+    if ($LASTEXITCODE -ne 0) { throw 'Core test compilation failed.' }
+    Invoke-BoundedTest $core
+    $engine = Join-Path $integrationDir 'windows_engine_integration.exe'
+    & $compiler @flags '-municode' '-DCAPSLANG_ENGINE_INTEGRATION' `
+        (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') $platform `
+        (Join-Path $projectRoot 'src\runtime\engine.cpp') (Join-Path $projectRoot 'src\platform\mwb.cpp') `
+        (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
+        '-o' $engine @libs '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32'
+    if ($LASTEXITCODE -ne 0) { throw 'Engine integration compilation failed.' }
+    Invoke-BoundedTest $engine
+    $ipc = Join-Path $integrationDir 'windows_ipc_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\windows_ipc_tests.cpp') `
+        (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') $platform '-o' $ipc @libs
+    if ($LASTEXITCODE -ne 0) { throw 'IPC test compilation failed.' }
+    Invoke-BoundedTest $ipc
+    $tls = Join-Path $integrationDir 'windows_tls_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\windows_tls_tests.cpp') `
+        (Join-Path $projectRoot 'src\network\tls.cpp') '-o' $tls '-lws2_32' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt'
+    if ($LASTEXITCODE -ne 0) { throw 'TLS test compilation failed.' }
+    Invoke-BoundedTest $tls
+    # Built but NEVER automatically run: this is the only hardware-writing test.
+    $led = Join-Path $integrationDir 'windows_led_integration.exe'
+    & $compiler @flags '-municode' (Join-Path $projectRoot 'tests\windows_led_integration.cpp') `
+        $platform '-o' $led @libs
+    if ($LASTEXITCODE -ne 0) { throw 'LED test compilation failed.' }
+    Write-Host 'Development components tested. No app installation or release artifact produced.'
+    return
 }
 
 if ($IntegrationOnly) {

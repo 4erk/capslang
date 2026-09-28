@@ -245,6 +245,13 @@ bool KeyboardLeds::SetScroll(size_t index, bool on, DWORD& error) {
         error = GetLastError();
         return false;
     }
+    KEYBOARD_INDICATOR_PARAMETERS actual{};
+    if (!QueryIndicators(device.handle, actual, error)) return false;
+    if ((actual.LedFlags & KEYBOARD_SCROLL_LOCK_ON) != (value.LedFlags & KEYBOARD_SCROLL_LOCK_ON)) {
+        // Several virtual/unsupported devices acknowledge SET but ignore it.
+        error = ERROR_NOT_SUPPORTED;
+        return false;
+    }
     error = ERROR_SUCCESS;
     return true;
 }

@@ -1,10 +1,11 @@
 [CmdletBinding()]
-param()
+param([switch]$Engine)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$source = Join-Path $projectRoot 'build\integration\windows_layout_integration.exe'
+$testName = if ($Engine) { 'windows_engine_integration.exe' } else { 'windows_layout_integration.exe' }
+$source = Join-Path $projectRoot ("build\integration\" + $testName)
 if (-not (Test-Path -LiteralPath $source)) {
     throw 'Build and run .\build.ps1 -IntegrationOnly first.'
 }
@@ -16,7 +17,7 @@ $expectedHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
 $runId = [Guid]::NewGuid().ToString('N')
 $runDir = Join-Path $projectRoot ("build\elevation\" + $runId)
 New-Item -ItemType Directory -Path $runDir -ErrorAction Stop | Out-Null
-$testPath = Join-Path $runDir 'windows_layout_integration.exe'
+$testPath = Join-Path $runDir $testName
 Copy-Item -LiteralPath $source -Destination $testPath -ErrorAction Stop
 if ((Get-FileHash -LiteralPath $testPath -Algorithm SHA256).Hash -ne $expectedHash) {
     throw 'Executable changed during staging; refusing to elevate.'

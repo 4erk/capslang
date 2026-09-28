@@ -7,6 +7,12 @@
 #include <functional>
 #include <string>
 #include <vector>
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+#include "../src/runtime/engine.hpp"
+#include "../src/platform/mwb.hpp"
+#include "../src/runtime/local_ipc.hpp"
+#include <atomic>
+#endif
 
 using namespace capslang;
 namespace {
@@ -34,7 +40,8 @@ LRESULT CALLBACK FixtureProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_INPUTLANGCHANGEREQUEST:
         InterlockedIncrement(&g_shared->requests);
         if (InterlockedCompareExchange(&g_shared->mode, 0, 0) == 1) return 0;
-        if (InterlockedCompareExchange(&g_shared->mode, 0, 0) == 2) {
+        if (InterlockedCompareExchange(&g_shared->mode, 0, 0) == 2 ||
+            (InterlockedCompareExchange(&g_shared->mode, 0, 0) == 3 && LOWORD(lp) == kRussian)) {
             g_pending = reinterpret_cast<HKL>(lp);
             SetTimer(window, 1, 180, nullptr);
             return 0;
@@ -99,17 +106,23 @@ int FixtureMain(HANDLE mapping, HANDLE ready, HANDLE stop) {
     return 0;
 }
 
-HANDLE LowToken() {
+HANDLE LowToken(DWORD integrity = SECURITY_MANDATORY_LOW_RID) {
     HANDLE source = nullptr, token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY |
             TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT, &source)) return nullptr;
+    BYTE adminStorage[SECURITY_MAX_SID_SIZE]{};
+    DWORD adminSize = sizeof(adminStorage);
+    if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, adminStorage, &adminSize)) {
+        CloseHandle(source); return nullptr;
+    }
+    SID_AND_ATTRIBUTES admin{adminStorage, 0};
     const bool restricted = CreateRestrictedToken(source, DISABLE_MAX_PRIVILEGE,
-        0, nullptr, 0, nullptr, 0, nullptr, &token) != FALSE;
+        1, &admin, 0, nullptr, 0, nullptr, &token) != FALSE;
     CloseHandle(source);
     if (!restricted) return nullptr;
     PSID sid = nullptr;
     SID_IDENTIFIER_AUTHORITY authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
-    if (!AllocateAndInitializeSid(&authority, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &sid)) {
+    if (!AllocateAndInitializeSid(&authority, 1, integrity, 0, 0, 0, 0, 0, 0, 0, &sid)) {
         CloseHandle(token); return nullptr;
     }
     TOKEN_MANDATORY_LABEL label{{sid, SE_GROUP_INTEGRITY}};
@@ -119,6 +132,34 @@ HANDLE LowToken() {
     if (!lowered) { CloseHandle(token); return nullptr; }
     return token;
 }
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+int IpcClientMain(HANDLE mapping, HANDLE ready, HANDLE stop) {
+    auto* data = static_cast<Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
+    if (!data) return 21;
+    HANDLE token = nullptr;
+    alignas(TOKEN_MANDATORY_LABEL) BYTE storage[256]{};
+    DWORD bytes = 0;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+        GetTokenInformation(token, TokenIntegrityLevel, storage, sizeof(storage), &bytes)) {
+        const auto* label = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(storage);
+        const UCHAR count = *GetSidSubAuthorityCount(label->Label.Sid);
+        data->integrityRid = count ? *GetSidSubAuthority(label->Label.Sid, count - 1) : 0;
+    }
+    if (token) CloseHandle(token);
+    wchar_t executable[32768]{};
+    GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
+    const auto endpoint = ipc::Endpoint::Current(L"engine-test-" + std::to_wstring(data->pid));
+    ipc::Request request{}; request.id = 1;
+    ipc::Response response{};
+    data->posted = ipc::Call(endpoint, executable, data->lowered, request, response, data->postError);
+    data->controlError = response.error;
+    SetEvent(ready);
+    WaitForSingleObject(stop, 5000);
+    UnmapViewOfFile(data);
+    CloseHandle(mapping); CloseHandle(ready); CloseHandle(stop);
+    return 0;
+}
+#endif
 
 int LowSenderMain(HANDLE mapping, HANDLE ready, HANDLE stop) {
     auto* data = static_cast<Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
@@ -165,7 +206,7 @@ struct Fixture {
         if (ready) CloseHandle(ready);
         if (stop) CloseHandle(stop);
     }
-    bool Start(std::wstring desktop, const LayoutTarget* destination = nullptr) {
+    bool Start(std::wstring desktop, const LayoutTarget* destination = nullptr, DWORD ipcIntegrity = 0) {
         SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
         mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(Shared), nullptr);
         ready = CreateEventW(&sa, TRUE, FALSE, nullptr);
@@ -175,6 +216,10 @@ struct Fixture {
         if (!data) return false;
         *data = {};
         if (destination) data->window = destination->focus;
+        if (ipcIntegrity) {
+            data->pid = GetCurrentProcessId();
+            data->lowered = ProcessElevation(GetCurrentProcessId()).elevated;
+        }
         job = CreateJobObjectW(nullptr, nullptr);
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -193,14 +238,15 @@ struct Fixture {
         wchar_t path[32768]{};
         GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
         std::wstring command = L"\"" + std::wstring(path) +
-            (destination ? L"\" --low-sender " : L"\" --fixture ") +
+            (ipcIntegrity ? L"\" --ipc-client " : destination ? L"\" --low-sender " : L"\" --fixture ") +
             std::to_wstring(reinterpret_cast<ULONG_PTR>(mapping)) + L" " +
             std::to_wstring(reinterpret_cast<ULONG_PTR>(ready)) + L" " +
             std::to_wstring(reinterpret_cast<ULONG_PTR>(stop));
         PROCESS_INFORMATION child{};
-        HANDLE lowToken = destination ? LowToken() : nullptr;
+        const bool restricted = destination || ipcIntegrity;
+        HANDLE lowToken = restricted ? LowToken(ipcIntegrity ? ipcIntegrity : SECURITY_MANDATORY_LOW_RID) : nullptr;
         constexpr DWORD flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
-        const bool created = attributes && (destination
+        const bool created = attributes && (restricted
             ? lowToken && CreateProcessAsUserW(lowToken, path, command.data(), nullptr, nullptr, TRUE,
                 flags, nullptr, nullptr, &startup.StartupInfo, &child)
             : CreateProcessW(path, command.data(), nullptr, nullptr, TRUE,
@@ -300,6 +346,88 @@ void Tests(const std::wstring& desktop) {
     const auto gone = RequestLayout(target, en);
     Check(!gone.posted && gone.postError == ERROR_INVALID_PARAMETER, "destroyed target not applied");
 }
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+std::atomic<HWND> capturedWindow{nullptr};
+LayoutTarget CaptureFixture() {
+    const HWND window = capturedWindow.load();
+    DWORD pid = 0;
+    const DWORD tid = GetWindowThreadProcessId(window, &pid);
+    return {window, window, pid, tid, GetKeyboardLayout(tid)};
+}
+void EngineTests(const std::wstring& desktop) {
+    using core::Language;
+    using core::ApplyState;
+    Fixture first, second;
+    if (!first.Start(desktop) || !second.Start(desktop)) {
+        Check(false, "engine foreign fixtures ready"); return;
+    }
+    capturedWindow = first.data->window;
+    Engine engine({false, CaptureFixture}); // No hardware writes in this suite.
+    Check(!engine.SetTarget(Language::Russian) && !engine.RestartHook(), "stopped engine rejects work");
+    Check(engine.Start(), "real engine worker starts on private desktop");
+    Check(PumpUntil([&] { return engine.Status().hookRegistered && engine.Status().hookThreadResponsive; }),
+          "real low-level hooks installed and dedicated thread responsive");
+    {
+        const auto endpoint = ipc::Endpoint::Current(L"engine-test-" + std::to_wstring(GetCurrentProcessId()));
+        ipc::Server server(endpoint, [&](const ipc::Request&) {
+            ipc::Response response{};
+            response.target = static_cast<DWORD>(engine.Status().target);
+            return response;
+        });
+        Check(server.Start(), "engine local IPC starts with SID/session ACL");
+        Fixture medium;
+        const bool mediumStarted = medium.Start(desktop, nullptr, SECURITY_MANDATORY_MEDIUM_RID);
+        Check(mediumStarted && medium.data->integrityRid == SECURITY_MANDATORY_MEDIUM_RID &&
+            medium.data->posted && !medium.data->controlError, "real medium-integrity child can use engine IPC");
+        Fixture low;
+        const bool lowStarted = low.Start(desktop, nullptr, SECURITY_MANDATORY_LOW_RID);
+        Check(lowStarted && low.data->integrityRid == SECURITY_MANDATORY_LOW_RID && !low.data->posted &&
+            low.data->postError == ERROR_ACCESS_DENIED, "real low-integrity child cannot use engine IPC");
+        std::printf("IPC boundary: elevated_server=%d medium_started=%d medium_rid=%lu medium_sent=%d error=%lu low_started=%d low_rid=%lu low_sent=%d error=%lu\n",
+            engine.Status().elevated, mediumStarted, medium.data ? medium.data->integrityRid : 0,
+            medium.data ? medium.data->posted : 0, medium.data ? medium.data->postError : 0,
+            lowStarted, low.data ? low.data->integrityRid : 0, low.data ? low.data->posted : 0, low.data ? low.data->postError : 0);
+    }
+    for (int i = 0; i < 40; ++i) {
+        const auto language = i % 2 ? Language::English : Language::Russian;
+        Check(engine.SetTarget(language) && PumpUntil([&] {
+            const auto state = engine.Status();
+            return state.target == language && state.actual == language && state.apply == ApplyState::Applied &&
+                TargetLanguage(first.Target()) == static_cast<LANGID>(language);
+        }), "production engine confirms absolute language in foreign process");
+    }
+    Check(engine.Status().userRevision == 0, "own application never echoed as manual activity");
+    Check(first.Reset(3), "fixture delays old RU but applies newer EN immediately");
+    const LONG beforeDelay = InterlockedCompareExchange(&first.data->requests, 0, 0);
+    Check(engine.SetTarget(Language::Russian) && PumpUntil([&] {
+        return InterlockedCompareExchange(&first.data->requests, 0, 0) > beforeDelay;
+    }), "old request is actually queued in the foreign process");
+    Check(engine.SetTarget(Language::English), "new target supersedes pending old request");
+    PumpUntil([] { return false; }, 650); // Let the deliberately stale callback fire.
+    Check(engine.Status().target == Language::English && engine.Status().actual == Language::English &&
+        engine.Status().userRevision == 0 && TargetLanguage(first.Target()) == kEnglish,
+        "late old acknowledgement cannot become a manual change or overwrite latest target");
+    Check(first.Reset(0), "fixture returns to ordinary message handling");
+    Check(engine.SetTarget(Language::Russian) && engine.SetTarget(Language::English) && engine.SetTarget(Language::Russian) &&
+        PumpUntil([&] { return engine.Status().actual == Language::Russian && engine.Status().apply == ApplyState::Applied; }),
+        "queued latest target wins");
+    const auto revision = engine.Status().userRevision;
+    capturedWindow = second.data->window;
+    Check(PumpUntil([&] { return TargetLanguage(second.Target()) == kRussian; }), "new focus receives shared language");
+    Check(engine.Status().target == Language::Russian && engine.Status().userRevision == revision,
+          "remembered focus layout does not become a local event");
+    const auto recovery = engine.Status().recoveries;
+    Check(engine.RestartHook() && PumpUntil([&] { return engine.Status().recoveries > recovery; }),
+          "hook refresh completes without F24");
+    Check(PumpUntil([&] { return engine.Status().recoveries > recovery + 1; }, 11500),
+          "automatic ten-second hook maintenance runs without input");
+    const auto stopStart = GetTickCount64();
+    engine.Stop();
+    Check(GetTickCount64() - stopStart < 2000 && !engine.Status().hookRegistered, "engine orderly shutdown removes hooks");
+    Check(!engine.SetTarget(Language::English) && !engine.RestartHook(), "post-stop work rejected");
+    capturedWindow = nullptr;
+}
+#endif
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -323,11 +451,26 @@ int wmain(int argc, wchar_t** argv) {
             reinterpret_cast<HANDLE>(wcstoull(argv[3], nullptr, 10)),
             reinterpret_cast<HANDLE>(wcstoull(argv[4], nullptr, 10)));
     }
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+    if (argc == 5 && wcscmp(argv[1], L"--ipc-client") == 0) {
+        return IpcClientMain(reinterpret_cast<HANDLE>(wcstoull(argv[2], nullptr, 10)),
+            reinterpret_cast<HANDLE>(wcstoull(argv[3], nullptr, 10)),
+            reinterpret_cast<HANDLE>(wcstoull(argv[4], nullptr, 10)));
+    }
+#endif
     if (argc == 5 && wcscmp(argv[1], L"--fixture") == 0) {
         return FixtureMain(reinterpret_cast<HANDLE>(wcstoull(argv[2], nullptr, 10)),
             reinterpret_cast<HANDLE>(wcstoull(argv[3], nullptr, 10)),
             reinterpret_cast<HANDLE>(wcstoull(argv[4], nullptr, 10)));
     }
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+    // Read only MWB's own routing-window metadata on the user's desktop before
+    // creating the test desktop. No hooks/input/layout changes on that desktop.
+    MwbObserver observer;
+    const auto mwb = observer.Read();
+    std::printf("MWB metadata (NOT activity acceptance): applications=%u helpers=%u supported=%d dots=%u visible=%d candidate=%u error=%lu\n",
+        mwb.applications, mwb.helpers, mwb.supportedBinary, mwb.dots, mwb.dotVisible, static_cast<unsigned>(mwb.route), mwb.error);
+#endif
     const HDESK original = GetThreadDesktop(GetCurrentThreadId());
     const std::wstring name = L"CapsLangTests-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
     // No DESKTOP_SWITCHDESKTOP: even this handle cannot activate the test desktop.
@@ -339,7 +482,11 @@ int wmain(int argc, wchar_t** argv) {
             SDDL_REVISION_1, &descriptor, nullptr)) return 17;
     SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
     const HDESK desktop = CreateDesktopW(name.c_str(), nullptr, nullptr, 0,
-        DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_ENUMERATE, &security);
+        DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_ENUMERATE
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+        | DESKTOP_HOOKCONTROL
+#endif
+        , &security);
     LocalFree(descriptor);
     if (!desktop || !SetThreadDesktop(desktop)) {
         std::fprintf(stderr, "Cannot isolate tests; refusing to run: %lu\n", GetLastError());
@@ -347,7 +494,12 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (SUCCEEDED(com) && FindLayout(kEnglish) && FindLayout(kRussian)) Tests(name);
+    if (SUCCEEDED(com) && FindLayout(kEnglish) && FindLayout(kRussian)) {
+        Tests(name);
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+        EngineTests(name);
+#endif
+    }
     else Check(false, "COM and installed EN/RU required; no layouts are installed by test");
     if (SUCCEEDED(com)) CoUninitialize();
     if (SetThreadDesktop(original)) CloseDesktop(desktop);

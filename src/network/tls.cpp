@@ -1,4 +1,5 @@
 #include "tls.hpp"
+#include "../platform/private_store.hpp"
 #include <bcrypt.h>
 #include <algorithm>
 #include <cstring>
@@ -16,13 +17,13 @@ bool CertificatePin(PCCERT_CONTEXT certificate, Pin& pin) {
 }
 Identity::~Identity() {
     if (certificate_) CertFreeCertificateContext(certificate_);
-    // This object currently owns only keys it generated. A failed/finished
-    // test leaves no persistent test key, certificate store or trusted root.
-    if (key_ && NCryptDeleteKey(key_, 0) != ERROR_SUCCESS) NCryptFreeObject(key_);
+    if (key_) {
+        if (!deleteKey_ || NCryptDeleteKey(key_, 0) != ERROR_SUCCESS) NCryptFreeObject(key_);
+    }
     if (provider_) NCryptFreeObject(provider_);
 }
 bool Identity::Generate(DWORD& error) {
-    if (key_ || certificate_) { error = ERROR_ALREADY_EXISTS; return false; }
+    if (provider_ || key_ || certificate_ || erased_) { error = ERROR_ALREADY_EXISTS; return false; }
     BYTE random[16]{};
     if (BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
         error = NTE_FAIL; return false;
@@ -32,6 +33,7 @@ bool Identity::Generate(DWORD& error) {
     for (BYTE byte : random) { name += hex[byte >> 4]; name += hex[byte & 15]; }
     SECURITY_STATUS status = NCryptOpenStorageProvider(&provider_, MS_KEY_STORAGE_PROVIDER, 0);
     if (!status) status = NCryptCreatePersistedKey(provider_, &key_, NCRYPT_RSA_ALGORITHM, name.c_str(), 0, 0);
+    if (!status) { keyName_ = name; deleteKey_ = true; }
     DWORD bits = 3072;
     if (!status) status = NCryptSetProperty(key_, NCRYPT_LENGTH_PROPERTY, reinterpret_cast<BYTE*>(&bits), sizeof(bits), 0);
     if (!status) status = NCryptFinalizeKey(key_, NCRYPT_SILENT_FLAG);
@@ -67,12 +69,95 @@ bool Identity::Generate(DWORD& error) {
 }
 Pin Identity::Fingerprint() const { Pin pin{}; CertificatePin(certificate_, pin); return pin; }
 
+namespace {
+struct IdentityHeader {
+    DWORD magic = 0x44494c43, version = 1, nameChars = 0, certificateBytes = 0;
+};
+bool ValidKeyName(const std::wstring& name) {
+    if (name.size() != 41 || name.compare(0, 9, L"CapsLang-") != 0) return false;
+    for (size_t i = 9; i < name.size(); ++i)
+        if (!((name[i] >= L'0' && name[i] <= L'9') || (name[i] >= L'a' && name[i] <= L'f'))) return false;
+    return true;
+}
+}
+bool Identity::Save(const std::wstring& path, DWORD& error) {
+    if (!certificate_ || !key_ || !deleteKey_ || !ValidKeyName(keyName_) || !storagePath_.empty()) {
+        error = ERROR_INVALID_STATE; return false;
+    }
+    IdentityHeader header;
+    header.nameChars = static_cast<DWORD>(keyName_.size()); header.certificateBytes = certificate_->cbCertEncoded;
+    const size_t nameBytes = keyName_.size() * sizeof(wchar_t);
+    std::vector<BYTE> blob(sizeof(header) + nameBytes + certificate_->cbCertEncoded);
+    std::memcpy(blob.data(), &header, sizeof(header));
+    std::memcpy(blob.data() + sizeof(header), keyName_.data(), nameBytes);
+    std::memcpy(blob.data() + sizeof(header) + nameBytes, certificate_->pbCertEncoded, certificate_->cbCertEncoded);
+    const bool saved = SavePrivateData(path, blob, false, error);
+    SecureZeroMemory(blob.data(), blob.size());
+    if (saved) { storagePath_ = path; deleteKey_ = false; }
+    return saved;
+}
+bool Identity::Load(const std::wstring& path, DWORD& error) {
+    if (provider_ || key_ || certificate_ || erased_) { error = ERROR_ALREADY_EXISTS; return false; }
+    std::vector<BYTE> blob;
+    struct Wipe { std::vector<BYTE>& data; ~Wipe() { if (!data.empty()) SecureZeroMemory(data.data(), data.size()); } } wipe{blob};
+    if (!LoadPrivateData(path, blob, error)) return false;
+    IdentityHeader header{};
+    if (blob.size() < sizeof(header)) { error = ERROR_INVALID_DATA; return false; }
+    std::memcpy(&header, blob.data(), sizeof(header));
+    if (header.magic != 0x44494c43 || header.version != 1 || header.nameChars != 41 || !header.certificateBytes ||
+        blob.size() != sizeof(header) + header.nameChars * sizeof(wchar_t) + header.certificateBytes) {
+        error = ERROR_INVALID_DATA; return false;
+    }
+    std::wstring name(header.nameChars, L'\0');
+    std::memcpy(name.data(), blob.data() + sizeof(header), name.size() * sizeof(wchar_t));
+    if (!ValidKeyName(name)) { error = ERROR_INVALID_DATA; return false; }
+    // An opened existing key is borrowed: failure must NEVER delete it.
+    // Commit the candidate only after every validation succeeds. A failed Load
+    // leaves this object reusable and releases all borrowed handles.
+    Identity candidate;
+    SECURITY_STATUS status = NCryptOpenStorageProvider(&candidate.provider_, MS_KEY_STORAGE_PROVIDER, 0);
+    if (!status) status = NCryptOpenKey(candidate.provider_, &candidate.key_, name.c_str(), 0, NCRYPT_SILENT_FLAG);
+    if (status) { error = status; return false; }
+    candidate.certificate_ = CertCreateCertificateContext(X509_ASN_ENCODING,
+        blob.data() + sizeof(header) + name.size() * sizeof(wchar_t), header.certificateBytes);
+    SecureZeroMemory(blob.data(), blob.size());
+    if (!candidate.certificate_) { error = GetLastError(); return false; }
+    CRYPT_KEY_PROV_INFO info{};
+    info.pwszContainerName = name.data(); info.pwszProvName = const_cast<wchar_t*>(MS_KEY_STORAGE_PROVIDER);
+    if (!CertSetCertificateContextProperty(candidate.certificate_, CERT_KEY_PROV_INFO_PROP_ID, 0, &info)) { error = GetLastError(); return false; }
+    HCRYPTPROV_OR_NCRYPT_KEY_HANDLE acquired = 0;
+    DWORD spec = 0; BOOL owned = FALSE;
+    const bool matches = CryptAcquireCertificatePrivateKey(candidate.certificate_, CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG |
+        CRYPT_ACQUIRE_COMPARE_KEY_FLAG | CRYPT_ACQUIRE_SILENT_FLAG, nullptr, &acquired, &spec, &owned) && spec == CERT_NCRYPT_KEY_SPEC;
+    error = matches ? 0 : GetLastError();
+    if (owned && acquired) NCryptFreeObject(acquired);
+    if (!matches) { if (!error) error = NTE_BAD_PUBLIC_KEY; return false; }
+    std::swap(provider_, candidate.provider_);
+    std::swap(key_, candidate.key_);
+    std::swap(certificate_, candidate.certificate_);
+    keyName_ = name; storagePath_ = path;
+    return true;
+}
+bool Identity::Erase(DWORD& error) {
+    if (erased_) { error = 0; return true; }
+    if (storagePath_.empty() || !ValidKeyName(keyName_)) { error = ERROR_INVALID_STATE; return false; }
+    if (key_) {
+        const SECURITY_STATUS status = NCryptDeleteKey(key_, 0);
+        if (status) { error = status; return false; }
+        key_ = 0;
+        if (certificate_) { CertFreeCertificateContext(certificate_); certificate_ = nullptr; }
+    }
+    // Keep the exact path after a sharing violation so cleanup can be retried.
+    if (!DeleteFileW(storagePath_.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) { error = GetLastError(); return false; }
+    storagePath_.clear(); erased_ = true; error = 0; return true;
+}
+
 struct TlsChannel::Impl {
     SOCKET socket;
     HANDLE cancel;
     CredHandle credential{};
     CtxtHandle context{};
-    bool haveCredential = false, haveContext = false, established = false, failed = false;
+    bool haveCredential = false, haveContext = false, established = false, failed = false, paired = false;
     SecPkgContext_StreamSizes sizes{};
     Pin peer{};
     DWORD error = 0;
@@ -187,7 +272,7 @@ bool TlsChannel::Handshake(const Identity& identity, bool server, const Pin& exp
             if (!valid) return self.Fail(status ? status : static_cast<DWORD>(SEC_E_WRONG_PRINCIPAL));
             status = QueryContextAttributesW(&self.context, SECPKG_ATTR_STREAM_SIZES, &self.sizes);
             if (status != SEC_E_OK || self.sizes.cbMaximumMessage < 1024) return self.Fail(status ? status : ERROR_NOT_SUPPORTED);
-            self.established = true; self.error = 0; return true;
+            self.established = true; self.paired = !invitation; self.error = 0; return true;
         }
         needRead = self.incoming.empty();
     }
@@ -207,10 +292,13 @@ bool TlsChannel::Send(const void* data, size_t bytes) {
     if (result != SEC_E_OK) return self.Fail(result);
     return self.Write(packet.data(), buffers[0].cbBuffer + buffers[1].cbBuffer + buffers[2].cbBuffer, GetTickCount64() + 1000);
 }
-bool TlsChannel::Receive(std::vector<BYTE>& data) {
+bool TlsChannel::Paired() const { return impl_->established && impl_->paired && !impl_->failed; }
+bool TlsChannel::Receive(std::vector<BYTE>& data, DWORD timeoutMs) {
     auto& self = *impl_;
+    data.clear();
     if (!self.established || self.failed) return self.Fail(ERROR_INVALID_STATE);
-    const auto deadline = GetTickCount64() + 1500;
+    if (!timeoutMs || timeoutMs > 1500) return self.Fail(ERROR_INVALID_PARAMETER);
+    const auto deadline = GetTickCount64() + timeoutMs;
     for (unsigned steps = 0; steps < 128; ++steps) {
         if (self.incoming.empty() && !self.Read(deadline)) return false;
         SecBuffer buffers[4]{{static_cast<ULONG>(self.incoming.size()), SECBUFFER_DATA, self.incoming.data()},

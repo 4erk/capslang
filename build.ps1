@@ -79,6 +79,7 @@ if ($RuntimeTestsOnly) {
         '-static', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-Wl,--no-insert-timestamp')
     $platform = Join-Path $projectRoot 'src\platform\windows_support.cpp'
     $libs = @('-lole32', '-luuid', '-luser32', '-ladvapi32', '-lsetupapi')
+    $runtimeFailures = New-Object 'System.Collections.Generic.List[string]'
     function Invoke-BoundedTest([string]$Path) {
         $test = New-Object System.Diagnostics.Process
         $test.StartInfo.FileName = $Path
@@ -93,17 +94,24 @@ if ($RuntimeTestsOnly) {
             if (-not $test.WaitForExit(45000)) {
                 $test.Kill()
                 $test.WaitForExit()
-                throw "Test exceeded 45 seconds: $Path"
+                Write-Host $stdoutTask.Result
+                if ($stderrTask.Result) { Write-Host $stderrTask.Result }
+                $runtimeFailures.Add("Test exceeded 45 seconds: $Path")
+                return
             }
             Write-Host $stdoutTask.Result
             if ($stderrTask.Result) { Write-Host $stderrTask.Result }
-            if ($test.ExitCode -ne 0) { throw "Test failed: $Path" }
+            if ($test.ExitCode -ne 0) { $runtimeFailures.Add("Test failed: $Path") }
         } finally { $test.Dispose() }
     }
     $core = Join-Path $integrationDir 'core_tests.exe'
     & $compiler @flags (Join-Path $projectRoot 'tests\core_tests.cpp') '-o' $core
     if ($LASTEXITCODE -ne 0) { throw 'Core test compilation failed.' }
     Invoke-BoundedTest $core
+    $sync = Join-Path $integrationDir 'sync_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\sync_tests.cpp') '-o' $sync
+    if ($LASTEXITCODE -ne 0) { throw 'Sync protocol compilation failed.' }
+    Invoke-BoundedTest $sync
     $engine = Join-Path $integrationDir 'windows_engine_integration.exe'
     & $compiler @flags '-municode' '-DCAPSLANG_ENGINE_INTEGRATION' `
         (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') $platform `
@@ -118,8 +126,9 @@ if ($RuntimeTestsOnly) {
     if ($LASTEXITCODE -ne 0) { throw 'IPC test compilation failed.' }
     Invoke-BoundedTest $ipc
     $tls = Join-Path $integrationDir 'windows_tls_tests.exe'
-    & $compiler @flags (Join-Path $projectRoot 'tests\windows_tls_tests.cpp') `
-        (Join-Path $projectRoot 'src\network\tls.cpp') '-o' $tls '-lws2_32' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt'
+    & $compiler @flags '-municode' (Join-Path $projectRoot 'tests\windows_tls_tests.cpp') `
+        (Join-Path $projectRoot 'src\network\tls.cpp') (Join-Path $projectRoot 'src\platform\private_store.cpp') `
+        '-o' $tls '-lws2_32' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
     if ($LASTEXITCODE -ne 0) { throw 'TLS test compilation failed.' }
     Invoke-BoundedTest $tls
     # Built but NEVER automatically run: this is the only hardware-writing test.
@@ -127,6 +136,7 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags '-municode' (Join-Path $projectRoot 'tests\windows_led_integration.cpp') `
         $platform '-o' $led @libs
     if ($LASTEXITCODE -ne 0) { throw 'LED test compilation failed.' }
+    if ($runtimeFailures.Count) { throw ($runtimeFailures -join [Environment]::NewLine) }
     Write-Host 'Development components tested. No app installation or release artifact produced.'
     return
 }
@@ -153,6 +163,8 @@ if ($IntegrationOnly) {
         if (-not $test.WaitForExit(30000)) {
             $test.Kill() # Exact child test process; its job reaps only its fixtures.
             $test.WaitForExit()
+            Write-Host $stdoutTask.Result
+            if ($stderrTask.Result) { Write-Host $stderrTask.Result }
             throw 'Windows integration tests exceeded 30 seconds.'
         }
         Write-Host $stdoutTask.Result

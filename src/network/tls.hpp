@@ -22,12 +22,17 @@ public:
     Identity(const Identity&) = delete;
     Identity& operator=(const Identity&) = delete;
     bool Generate(DWORD& error);
+    bool Save(const std::wstring& path, DWORD& error);
+    bool Load(const std::wstring& path, DWORD& error);
+    bool Erase(DWORD& error);
     PCCERT_CONTEXT Certificate() const { return certificate_; }
     Pin Fingerprint() const;
 private:
     NCRYPT_PROV_HANDLE provider_ = 0;
     NCRYPT_KEY_HANDLE key_ = 0;
     PCCERT_CONTEXT certificate_ = nullptr;
+    std::wstring keyName_, storagePath_;
+    bool deleteKey_ = false, erased_ = false;
 };
 // Socket ownership stays with caller. No roots are installed; the peer must
 // prove possession of the private key for the exact out-of-band pinned cert.
@@ -42,7 +47,8 @@ public:
     bool Handshake(const Identity& identity, bool server, const Pin& expected,
                    bool temporaryInvitationClient = false);
     bool Send(const void* data, size_t bytes);
-    bool Receive(std::vector<BYTE>& data);
+    bool Receive(std::vector<BYTE>& data, DWORD timeoutMs = 1500);
+    bool Paired() const;
     DWORD Error() const;
     Pin Peer() const;
 private:

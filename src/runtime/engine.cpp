@@ -4,6 +4,9 @@
 #include <wtsapi32.h>
 #include <atomic>
 #include <mutex>
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+#include <cstdio>
+#endif
 
 namespace capslang {
 namespace {
@@ -30,6 +33,7 @@ struct Engine::Impl {
     EngineStatus status;
     core::LayoutState layout;
     LayoutTarget target;
+    std::unique_ptr<LayoutApplier> applier;
     KeyboardLeds leds;
     HANDLE worker = nullptr, workerReady = nullptr, stopEvent = nullptr, hook = nullptr, hookReady = nullptr;
     HDESK desktop = nullptr;
@@ -40,7 +44,7 @@ struct Engine::Impl {
     std::atomic<unsigned> recoveryCount{0};
     core::KeyboardState keys;
     HPOWERNOTIFY power = nullptr;
-    bool wts = false, locked = false;
+    bool wts = false, locked = false, ticking = false;
     ULONGLONG manualUntil = 0, ownApplyUntil = 0, ledNextDiscovery = 0, ledNextCheck = 0;
     core::Language manualBefore = core::Language::Unknown;
     static thread_local Impl* hookOwner;
@@ -171,6 +175,12 @@ struct Engine::Impl {
         status.ledError = lastError ? lastError : (written ? 0 : ERROR_NOT_SUPPORTED);
     }
     void Tick() {
+        // COM/TSF calls may pump this STA's window messages. Nested timers or
+        // kSet messages must not recursively enter another TSF activation.
+        // New commands still update the generation; the next outer tick sees it.
+        if (ticking) return;
+        ticking = true;
+        struct TickGuard { bool& active; ~TickGuard() { active = false; } } guard{ticking};
         const auto now = GetTickCount64();
         if (locked) { Publish(); return; }
         const auto focus = options.capture();
@@ -205,7 +215,15 @@ struct Engine::Impl {
         layout.Observe(actual, layout.Generation(), now);
         if (layout.Due(now)) {
             const auto generation = layout.Generation();
-            const auto request = RequestLayout(target, FindLayout(static_cast<LANGID>(layout.Target())));
+            const auto request = applier->Request(target, FindLayout(static_cast<LANGID>(layout.Target())));
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+            if (request.changeMs + request.profileMs + request.cleanupMs > 100) {
+                std::printf("Engine slow request: change=%llu profile=%llu post=%llu ms generation=%llu\n",
+                    static_cast<unsigned long long>(request.changeMs), static_cast<unsigned long long>(request.profileMs),
+                    static_cast<unsigned long long>(request.cleanupMs), static_cast<unsigned long long>(generation));
+                std::fflush(stdout);
+            }
+#endif
             Error(&EngineStatus::layoutError, request.postError);
             layout.Sent(generation, now);
         }
@@ -263,6 +281,7 @@ struct Engine::Impl {
         HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kEngineClass, L"", WS_POPUP, 0, 0, 0, 0,
             nullptr, nullptr, wc.hInstance, &self);
         if (!hwnd) { CoUninitialize(); SetEvent(self.workerReady); return 3; }
+        self.applier = std::make_unique<LayoutApplier>();
         self.window = hwnd;
         const auto rights = ProcessElevation(GetCurrentProcessId());
         { std::lock_guard<std::mutex> guard(self.statusMutex); self.status.elevated = rights.known && rights.elevated; }
@@ -300,6 +319,7 @@ struct Engine::Impl {
         self.window = nullptr;
         DestroyWindow(hwnd);
         self.Publish();
+        self.applier.reset(); // Release TSF on its owning STA before COM shutdown.
         CoUninitialize(); return 0;
     }
 };

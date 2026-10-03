@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <memory>
 
 namespace capslang {
 
@@ -45,11 +46,26 @@ struct LayoutRequestResult {
     HRESULT activateProfile = E_UNEXPECTED;
     DWORD postError = ERROR_SUCCESS;
     bool posted = false;
+    ULONGLONG threadMs = 0, changeMs = 0, profileMs = 0, cleanupMs = 0;
 };
 
 // Caller owns a COM STA and performs bounded, asynchronous read-back. Never
 // call from a keyboard callback. Success of an API is not proof of a change.
 LayoutRequestResult RequestLayout(const LayoutTarget& target, HKL layout);
+
+// Construct/use/destroy on one initialized COM STA, before CoUninitialize.
+// Keep TSF activation alive for the worker lifetime, not per keystroke.
+class LayoutApplier {
+public:
+    LayoutApplier();
+    ~LayoutApplier();
+    LayoutApplier(const LayoutApplier&) = delete;
+    LayoutApplier& operator=(const LayoutApplier&) = delete;
+    LayoutRequestResult Request(const LayoutTarget& target, HKL layout);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 class KeyboardLeds {
 public:

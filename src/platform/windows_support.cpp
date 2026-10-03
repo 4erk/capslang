@@ -94,49 +94,74 @@ LANGID TargetLanguage(const LayoutTarget& target) {
     return LOWORD(reinterpret_cast<ULONG_PTR>(GetKeyboardLayout(target.threadId)));
 }
 
-LayoutRequestResult RequestLayout(const LayoutTarget& target, HKL layout) {
+struct LayoutApplier::Impl {
+    DWORD owner = GetCurrentThreadId();
+    ITfThreadMgr* threadManager = nullptr;
+    ITfInputProcessorProfiles* profiles = nullptr;
+    ITfInputProcessorProfileMgr* manager = nullptr;
+    HRESULT threadResult = E_UNEXPECTED, profilesResult = E_UNEXPECTED, managerResult = E_UNEXPECTED;
+    bool activated = false;
+    Impl() {
+        threadResult = CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER,
+            IID_ITfThreadMgr, reinterpret_cast<void**>(&threadManager));
+        if (SUCCEEDED(threadResult)) {
+            TfClientId client = 0;
+            threadResult = threadManager->Activate(&client);
+            activated = SUCCEEDED(threadResult);
+        }
+        profilesResult = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+            IID_ITfInputProcessorProfiles, reinterpret_cast<void**>(&profiles));
+        if (SUCCEEDED(profilesResult)) managerResult = profiles->QueryInterface(
+            IID_ITfInputProcessorProfileMgr, reinterpret_cast<void**>(&manager));
+    }
+    ~Impl() {
+        if (manager) manager->Release();
+        if (profiles) profiles->Release();
+        if (activated) threadManager->Deactivate();
+        if (threadManager) threadManager->Release();
+    }
+};
+LayoutApplier::LayoutApplier() : impl_(std::make_unique<Impl>()) {}
+LayoutApplier::~LayoutApplier() = default;
+LayoutRequestResult LayoutApplier::Request(const LayoutTarget& target, HKL layout) {
     LayoutRequestResult result;
+    auto& self = *impl_;
+    if (GetCurrentThreadId() != self.owner) { result.postError = ERROR_INVALID_THREAD_ID; return result; }
     if (!TargetStillValid(target) || !layout ||
         !IsSupportedLanguage(LOWORD(reinterpret_cast<ULONG_PTR>(layout)))) {
         result.postError = ERROR_INVALID_PARAMETER;
         return result;
     }
 
-    ITfThreadMgr* threadManager = nullptr;
-    TfClientId client = 0;
-    result.threadManager = CoCreateInstance(CLSID_TF_ThreadMgr, nullptr,
-        CLSCTX_INPROC_SERVER, IID_ITfThreadMgr, reinterpret_cast<void**>(&threadManager));
-    bool activatedThread = false;
-    if (SUCCEEDED(result.threadManager)) {
-        result.threadManager = threadManager->Activate(&client);
-        activatedThread = SUCCEEDED(result.threadManager);
-    }
-
-    ITfInputProcessorProfiles* profiles = nullptr;
-    result.changeLanguage = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr,
-        CLSCTX_INPROC_SERVER, IID_ITfInputProcessorProfiles, reinterpret_cast<void**>(&profiles));
+    auto stage = GetTickCount64();
+    result.threadManager = self.threadResult;
+    result.threadMs = GetTickCount64() - stage; stage = GetTickCount64();
+    result.changeLanguage = self.profilesResult;
     if (SUCCEEDED(result.changeLanguage)) {
         const LANGID language = LOWORD(reinterpret_cast<ULONG_PTR>(layout));
-        result.changeLanguage = profiles->ChangeCurrentLanguage(language);
-        ITfInputProcessorProfileMgr* manager = nullptr;
-        result.activateProfile = profiles->QueryInterface(IID_ITfInputProcessorProfileMgr,
-                                                          reinterpret_cast<void**>(&manager));
+        result.changeLanguage = self.profiles->ChangeCurrentLanguage(language);
+        result.changeMs = GetTickCount64() - stage; stage = GetTickCount64();
+        result.activateProfile = self.managerResult;
         if (SUCCEEDED(result.activateProfile)) {
-            result.activateProfile = manager->ActivateProfile(TF_PROFILETYPE_KEYBOARDLAYOUT,
+            result.activateProfile = self.manager->ActivateProfile(TF_PROFILETYPE_KEYBOARDLAYOUT,
                 language, CLSID_NULL, GUID_NULL, layout, kProfileForSession);
-            manager->Release();
         }
-        profiles->Release();
     }
+    result.profileMs = GetTickCount64() - stage; stage = GetTickCount64();
     // Explicit HKL, never HKL_NEXT/HKL_PREV: repeat delivery is idempotent.
     result.posted = PostMessageW(target.focus, WM_INPUTLANGCHANGEREQUEST, 0,
                                  reinterpret_cast<LPARAM>(layout)) != FALSE;
     result.postError = result.posted ? ERROR_SUCCESS : GetLastError();
-    if (threadManager) {
-        if (activatedThread) threadManager->Deactivate();
-        threadManager->Release();
-    }
+    result.cleanupMs = GetTickCount64() - stage;
     return result;
+}
+
+LayoutRequestResult RequestLayout(const LayoutTarget& target, HKL layout) {
+    if (!TargetStillValid(target) || !layout || !IsSupportedLanguage(LOWORD(reinterpret_cast<ULONG_PTR>(layout)))) {
+        LayoutRequestResult rejected; rejected.postError = ERROR_INVALID_PARAMETER; return rejected;
+    }
+    LayoutApplier applier;
+    return applier.Request(target, layout);
 }
 
 KeyboardLeds::~KeyboardLeds() { Close(); }

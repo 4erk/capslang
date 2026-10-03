@@ -24,6 +24,8 @@ struct Shared {
     volatile LONG requests, changes, mode, resetCount;
     DWORD tokenError, postError, controlError, integrityRid;
     BOOL lowered, posted, controlPosted;
+    volatile LONG handlingLayout;
+    ULONGLONG layoutEntered, layoutReturned;
 };
 Shared* g_shared = nullptr;
 HKL g_pending = nullptr;
@@ -58,6 +60,14 @@ LRESULT CALLBACK FixtureProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         break;
     case WM_INPUTLANGCHANGE: InterlockedIncrement(&g_shared->changes); break;
     }
+    if (message == WM_INPUTLANGCHANGEREQUEST) {
+        g_shared->layoutEntered = GetTickCount64();
+        InterlockedExchange(&g_shared->handlingLayout, 1);
+        const auto result = DefWindowProcW(window, message, wp, lp);
+        g_shared->layoutReturned = GetTickCount64();
+        InterlockedExchange(&g_shared->handlingLayout, 0);
+        return result;
+    }
     return DefWindowProcW(window, message, wp, lp);
 }
 
@@ -74,6 +84,44 @@ bool PumpUntil(const std::function<bool()>& done, DWORD timeout = 1200) {
     } while (GetTickCount64() - start < timeout);
     return done();
 }
+
+struct FixtureSecurity {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PSECURITY_DESCRIPTOR processDescriptor = nullptr;
+    std::wstring sid;
+    FixtureSecurity() {
+        HANDLE token = nullptr;
+        DWORD size = 0;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+        std::vector<BYTE> user(size);
+        wchar_t* text = nullptr;
+        if (size && GetTokenInformation(token, TokenUser, user.data(), size, &size) &&
+            ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &text)) {
+            sid = text; LocalFree(text);
+            // Only this test's disposable objects: never Default desktop or a
+            // production pipe. High-token default DACLs can grant only Admins,
+            // a SID deliberately disabled in our low/medium test children.
+            const std::wstring dacl = L"O:" + sid + L"G:SYD:P(A;;GA;;;SY)(A;;GA;;;" + sid + L")";
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(dacl.c_str(), SDDL_REVISION_1, &processDescriptor, nullptr);
+            const std::wstring low = dacl + L"S:(ML;;NW;;;LW)";
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(low.c_str(), SDDL_REVISION_1, &descriptor, nullptr);
+        }
+        CloseHandle(token);
+    }
+    ~FixtureSecurity() {
+        if (descriptor) LocalFree(descriptor);
+        if (processDescriptor) LocalFree(processDescriptor);
+    }
+    FixtureSecurity(const FixtureSecurity&) = delete;
+    FixtureSecurity& operator=(const FixtureSecurity&) = delete;
+    bool SetTokenDefault(HANDLE token) const {
+        BOOL present = FALSE, defaulted = FALSE;
+        TOKEN_DEFAULT_DACL value{};
+        return descriptor && GetSecurityDescriptorDacl(descriptor, &present, &value.DefaultDacl, &defaulted) && present &&
+            SetTokenInformation(token, TokenDefaultDacl, &value, sizeof(value));
+    }
+};
 
 int FixtureMain(HANDLE mapping, HANDLE ready, HANDLE stop) {
     g_shared = static_cast<Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
@@ -120,6 +168,8 @@ HANDLE LowToken(DWORD integrity = SECURITY_MANDATORY_LOW_RID) {
         1, &admin, 0, nullptr, 0, nullptr, &token) != FALSE;
     CloseHandle(source);
     if (!restricted) return nullptr;
+    const FixtureSecurity security;
+    if (!security.SetTokenDefault(token)) { CloseHandle(token); return nullptr; }
     PSID sid = nullptr;
     SID_IDENTIFIER_AUTHORITY authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
     if (!AllocateAndInitializeSid(&authority, 1, integrity, 0, 0, 0, 0, 0, 0, 0, &sid)) {
@@ -131,6 +181,96 @@ HANDLE LowToken(DWORD integrity = SECURITY_MANDATORY_LOW_RID) {
     FreeSid(sid);
     if (!lowered) { CloseHandle(token); return nullptr; }
     return token;
+}
+
+bool RestrictedDesktopAccess(PSECURITY_DESCRIPTOR descriptor, bool expected) {
+    // Isolate the disabled-Admins DACL condition from mandatory integrity.
+    // Actual low-integrity delivery is checked separately with real children.
+    HANDLE primary = LowToken(SECURITY_MANDATORY_MEDIUM_RID), impersonation = nullptr;
+    bool ok = primary && DuplicateToken(primary, SecurityImpersonation, &impersonation);
+    if (ok) {
+        GENERIC_MAPPING mapping{DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS, DESKTOP_ENUMERATE, 0x01ff};
+        BOOL present = FALSE, defaulted = FALSE;
+        PACL source = nullptr;
+        PSID owner = nullptr, group = nullptr;
+        if (!GetSecurityDescriptorDacl(descriptor, &present, &source, &defaulted) || !present || !source ||
+            !GetSecurityDescriptorOwner(descriptor, &owner, &defaulted) ||
+            !GetSecurityDescriptorGroup(descriptor, &group, &defaulted)) {
+            CloseHandle(primary); CloseHandle(impersonation); return false;
+        }
+        // Object creation normally maps generic ACE masks to object-specific
+        // rights. This direct AccessCheck fixture must perform that step too.
+        std::vector<BYTE> mapped(source->AclSize);
+        CopyMemory(mapped.data(), source, mapped.size());
+        auto* acl = reinterpret_cast<ACL*>(mapped.data());
+        for (DWORD index = 0; index < acl->AceCount; ++index) {
+            void* ace = nullptr;
+            if (GetAce(acl, index, &ace) &&
+                (static_cast<ACE_HEADER*>(ace)->AceType == ACCESS_ALLOWED_ACE_TYPE ||
+                 static_cast<ACE_HEADER*>(ace)->AceType == ACCESS_DENIED_ACE_TYPE))
+                MapGenericMask(&static_cast<ACCESS_ALLOWED_ACE*>(ace)->Mask, &mapping);
+        }
+        SECURITY_DESCRIPTOR checkDescriptor{};
+        InitializeSecurityDescriptor(&checkDescriptor, SECURITY_DESCRIPTOR_REVISION);
+        SetSecurityDescriptorOwner(&checkDescriptor, owner, FALSE);
+        SetSecurityDescriptorGroup(&checkDescriptor, group, FALSE);
+        SetSecurityDescriptorDacl(&checkDescriptor, TRUE, acl, FALSE);
+        alignas(PRIVILEGE_SET) BYTE storage[1024]{};
+        DWORD bytes = sizeof(storage), granted = 0;
+        BOOL allowed = FALSE;
+        ok = AccessCheck(&checkDescriptor, impersonation, DESKTOP_CREATEWINDOW, &mapping,
+            reinterpret_cast<PRIVILEGE_SET*>(storage), &bytes, &granted, &allowed) && (allowed != FALSE) == expected;
+    }
+    if (primary) CloseHandle(primary);
+    if (impersonation) CloseHandle(impersonation);
+    return ok;
+}
+
+void DescribeTokenAcl(HANDLE token, const char* label) {
+    DWORD bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+    std::vector<BYTE> user(bytes);
+    if (!bytes || !GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes)) {
+        std::printf("Token ACL %s: user_error=%lu\n", label, GetLastError()); return;
+    }
+    GetTokenInformation(token, TokenDefaultDacl, nullptr, 0, &bytes);
+    std::vector<BYTE> data(bytes);
+    if (!bytes || !GetTokenInformation(token, TokenDefaultDacl, data.data(), bytes, &bytes)) {
+        std::printf("Token ACL %s: acl_error=%lu\n", label, GetLastError()); return;
+    }
+    const auto acl = reinterpret_cast<TOKEN_DEFAULT_DACL*>(data.data())->DefaultDacl;
+    DWORD userAllow = 0;
+    for (DWORD i = 0; acl && i < acl->AceCount; ++i) {
+        void* ace = nullptr;
+        if (GetAce(acl, i, &ace) && static_cast<ACE_HEADER*>(ace)->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            auto* allow = static_cast<ACCESS_ALLOWED_ACE*>(ace);
+            if (EqualSid(&allow->SidStart, reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid)) userAllow |= allow->Mask;
+        }
+    }
+    SECURITY_DESCRIPTOR descriptor{};
+    InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION);
+    const auto sid = reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
+    SetSecurityDescriptorOwner(&descriptor, sid, FALSE);
+    SetSecurityDescriptorGroup(&descriptor, sid, FALSE);
+    SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE);
+    const bool allowed = RestrictedDesktopAccess(&descriptor, true);
+    const bool denied = RestrictedDesktopAccess(&descriptor, false);
+    std::printf("Token ACL %s: null=%d ace_count=%u explicit_current_user_allow=0x%08lx restricted_desktop_allowed=%d denied=%d\n",
+        label, !acl, acl ? acl->AceCount : 0, userAllow, allowed, denied);
+}
+
+int TokenInventory() {
+    HANDLE own = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &own)) return 1;
+    DescribeTokenAcl(own, "own");
+    TOKEN_LINKED_TOKEN linked{};
+    DWORD bytes = 0;
+    if (GetTokenInformation(own, TokenLinkedToken, &linked, sizeof(linked), &bytes)) {
+        DescribeTokenAcl(linked.LinkedToken, "linked-query-only");
+        CloseHandle(linked.LinkedToken);
+    } else std::printf("Token linked query error=%lu\n", GetLastError());
+    CloseHandle(own);
+    return 0;
 }
 #ifdef CAPSLANG_ENGINE_INTEGRATION
 int IpcClientMain(HANDLE mapping, HANDLE ready, HANDLE stop) {
@@ -207,7 +347,9 @@ struct Fixture {
         if (stop) CloseHandle(stop);
     }
     bool Start(std::wstring desktop, const LayoutTarget* destination = nullptr, DWORD ipcIntegrity = 0) {
-        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+        const FixtureSecurity security;
+        if (!security.descriptor || !security.processDescriptor) { std::printf("Fixture security error=%lu\n", GetLastError()); return false; }
+        SECURITY_ATTRIBUTES sa{sizeof(sa), security.descriptor, TRUE};
         mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(Shared), nullptr);
         ready = CreateEventW(&sa, TRUE, FALSE, nullptr);
         stop = CreateEventW(&sa, TRUE, FALSE, nullptr);
@@ -243,13 +385,14 @@ struct Fixture {
             std::to_wstring(reinterpret_cast<ULONG_PTR>(ready)) + L" " +
             std::to_wstring(reinterpret_cast<ULONG_PTR>(stop));
         PROCESS_INFORMATION child{};
+        SECURITY_ATTRIBUTES childSecurity{sizeof(childSecurity), security.processDescriptor, FALSE};
         const bool restricted = destination || ipcIntegrity;
         HANDLE lowToken = restricted ? LowToken(ipcIntegrity ? ipcIntegrity : SECURITY_MANDATORY_LOW_RID) : nullptr;
         constexpr DWORD flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
         const bool created = attributes && (restricted
-            ? lowToken && CreateProcessAsUserW(lowToken, path, command.data(), nullptr, nullptr, TRUE,
+            ? lowToken && CreateProcessAsUserW(lowToken, path, command.data(), &childSecurity, &childSecurity, TRUE,
                 flags, nullptr, nullptr, &startup.StartupInfo, &child)
-            : CreateProcessW(path, command.data(), nullptr, nullptr, TRUE,
+            : CreateProcessW(path, command.data(), &childSecurity, &childSecurity, TRUE,
                 flags, nullptr, nullptr, &startup.StartupInfo, &child));
         const DWORD createError = created ? 0 : GetLastError();
         if (lowToken) CloseHandle(lowToken);
@@ -257,12 +400,24 @@ struct Fixture {
         if (!created) { std::printf("Create fixture error=%lu\n", createError); return false; }
         process = child.hProcess;
         const bool assigned = AssignProcessToJobObject(job, process) != FALSE;
-        if (assigned) ResumeThread(child.hThread);
-        else TerminateProcess(process, 13); // Only our not-yet-started test child.
+        const DWORD assignError = assigned ? 0 : GetLastError();
+        if (assigned) {
+            if (ResumeThread(child.hThread) == static_cast<DWORD>(-1)) {
+                std::printf("Resume fixture error=%lu\n", GetLastError());
+                CloseHandle(child.hThread); return false;
+            }
+        } else TerminateProcess(process, 13); // Only our not-yet-started test child.
         CloseHandle(child.hThread);
-        if (!assigned) return false;
+        if (!assigned) { std::printf("Assign fixture job error=%lu\n", assignError); return false; }
         HANDLE waits[]{ready, process};
-        return WaitForMultipleObjects(2, waits, FALSE, 5000) == WAIT_OBJECT_0;
+        const DWORD waited = WaitForMultipleObjects(2, waits, FALSE, 5000);
+        if (waited != WAIT_OBJECT_0) {
+            DWORD exitCode = 0;
+            GetExitCodeProcess(process, &exitCode);
+            std::printf("Fixture startup: wait=%lu exit=0x%08lx restricted=%d requested_rid=%lu\n",
+                waited, exitCode, restricted, ipcIntegrity ? ipcIntegrity : SECURITY_MANDATORY_LOW_RID);
+        }
+        return waited == WAIT_OBJECT_0;
     }
     LayoutTarget Target() const {
         return {data->window, data->window, data->pid, data->tid, GetKeyboardLayout(data->tid)};
@@ -277,13 +432,25 @@ struct Fixture {
 
 unsigned checks = 0, failures = 0;
 void Check(bool ok, const char* name) {
+    static const ULONGLONG began = GetTickCount64();
     ++checks;
     if (!ok) ++failures;
-    std::printf("%s %s\n", ok ? "PASS" : "FAIL", name);
+    std::printf("%s %s [elapsed=%llu ms]\n", ok ? "PASS" : "FAIL", name,
+                static_cast<unsigned long long>(GetTickCount64() - began));
     std::fflush(stdout);
 }
 
 void Tests(const std::wstring& desktop) {
+    LayoutApplier applier;
+    {
+        const FixtureSecurity security;
+        PSECURITY_DESCRIPTOR adminDefault = nullptr;
+        const auto dacl = L"O:" + security.sid + L"G:SYD:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GR;;;BU)";
+        const bool made = ConvertStringSecurityDescriptorToSecurityDescriptorW(dacl.c_str(), SDDL_REVISION_1, &adminDefault, nullptr);
+        Check(made && RestrictedDesktopAccess(adminDefault, false) && RestrictedDesktopAccess(security.processDescriptor, true),
+              "Admin-only default DACL denies restricted child; explicit test-user ACL permits it");
+        if (adminDefault) LocalFree(adminDefault);
+    }
     Fixture fixture;
     if (!fixture.Start(desktop)) {
         std::printf("Fixture start error=%lu\n", GetLastError());
@@ -294,9 +461,17 @@ void Tests(const std::wstring& desktop) {
     Check(TargetStillValid(target), "real target identity validated");
     Check(TargetLanguage(target) == kEnglish, "fixture initial EN");
     const HKL ru = FindLayout(kRussian), en = FindLayout(kEnglish);
+    ULONGLONG slowest = 0;
     for (int i = 0; i < 20; ++i) {
         const HKL desired = i % 2 == 0 ? ru : en;
-        const auto result = RequestLayout(target, desired);
+        const auto requestStart = GetTickCount64();
+        const auto result = applier.Request(target, desired);
+        slowest = (std::max)(slowest, GetTickCount64() - requestStart);
+        if (result.threadMs + result.changeMs + result.profileMs + result.cleanupMs > 100) {
+            std::printf("Slow layout stage: thread=%llu change=%llu profile=%llu cleanup=%llu ms\n",
+                static_cast<unsigned long long>(result.threadMs), static_cast<unsigned long long>(result.changeMs),
+                static_cast<unsigned long long>(result.profileMs), static_cast<unsigned long long>(result.cleanupMs));
+        }
         const bool verified = PumpUntil([&] {
             return TargetLanguage(target) == LOWORD(reinterpret_cast<ULONG_PTR>(desired));
         });
@@ -307,11 +482,12 @@ void Tests(const std::wstring& desktop) {
         }
         Check(result.posted && verified, "absolute language reaches real foreign window");
     }
-    RequestLayout(target, en);
+    Check(slowest < 1000, "steady layout application avoids repeated TSF activation stalls");
+    applier.Request(target, en);
     Check(PumpUntil([&] { return TargetLanguage(target) == kEnglish; }), "repeated EN does not toggle");
     auto wrong = target;
     wrong.processId = GetCurrentProcessId();
-    const auto invalid = RequestLayout(wrong, ru);
+    const auto invalid = applier.Request(wrong, ru);
     Check(!invalid.posted && invalid.postError == ERROR_INVALID_PARAMETER, "foreign identity mismatch refused");
 
     {
@@ -343,7 +519,7 @@ void Tests(const std::wstring& desktop) {
     Check(PumpUntil([&] { return TargetLanguage(target) == kRussian; }), "delayed acknowledgement verified");
     Check(PostMessageW(target.focus, kDestroy, 0, 0) && PumpUntil([&] { return !TargetStillValid(target); }),
           "destroyed target invalidated");
-    const auto gone = RequestLayout(target, en);
+    const auto gone = applier.Request(target, en);
     Check(!gone.posted && gone.postError == ERROR_INVALID_PARAMETER, "destroyed target not applied");
 }
 #ifdef CAPSLANG_ENGINE_INTEGRATION
@@ -390,11 +566,23 @@ void EngineTests(const std::wstring& desktop) {
     }
     for (int i = 0; i < 40; ++i) {
         const auto language = i % 2 ? Language::English : Language::Russian;
-        Check(engine.SetTarget(language) && PumpUntil([&] {
+        const bool applied = engine.SetTarget(language) && PumpUntil([&] {
             const auto state = engine.Status();
             return state.target == language && state.actual == language && state.apply == ApplyState::Applied &&
                 TargetLanguage(first.Target()) == static_cast<LANGID>(language);
-        }), "production engine confirms absolute language in foreign process");
+        });
+        if (!applied) {
+            const auto state = engine.Status();
+            std::printf("Apply failure: index=%d desired=%04x target=%04x actual=%04x window=%04x apply=%u error=%lu generation=%llu\n",
+                i, static_cast<unsigned>(language), static_cast<unsigned>(state.target), static_cast<unsigned>(state.actual),
+                TargetLanguage(first.Target()), static_cast<unsigned>(state.apply), state.layoutError,
+                static_cast<unsigned long long>(state.generation));
+            std::printf("Fixture state: requests=%ld changes=%ld mode=%ld handling=%ld entered_ago=%llu returned_ago=%llu\n",
+                first.data->requests, first.data->changes, first.data->mode, first.data->handlingLayout,
+                static_cast<unsigned long long>(GetTickCount64() - first.data->layoutEntered),
+                static_cast<unsigned long long>(GetTickCount64() - first.data->layoutReturned));
+        }
+        Check(applied, "production engine confirms absolute language in foreign process");
     }
     Check(engine.Status().userRevision == 0, "own application never echoed as manual activity");
     Check(first.Reset(3), "fixture delays old RU but applies newer EN immediately");
@@ -431,6 +619,7 @@ void EngineTests(const std::wstring& desktop) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && wcscmp(argv[1], L"--token-inventory") == 0) return TokenInventory();
     if (argc == 2 && wcscmp(argv[1], L"--elevated-report") == 0) {
         wchar_t path[32768]{};
         GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
@@ -477,17 +666,15 @@ int wmain(int argc, wchar_t** argv) {
     // Allow the low-integrity test child to JOIN this disposable desktop.
     // Its medium/high target windows retain their own UIPI protection. The
     // user's Default desktop and existing objects are never relabeled.
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)",
-            SDDL_REVISION_1, &descriptor, nullptr)) return 17;
-    SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
+    const FixtureSecurity fixtureSecurity;
+    if (!fixtureSecurity.descriptor) return 17;
+    SECURITY_ATTRIBUTES security{sizeof(security), fixtureSecurity.descriptor, FALSE};
     const HDESK desktop = CreateDesktopW(name.c_str(), nullptr, nullptr, 0,
         DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_ENUMERATE
 #ifdef CAPSLANG_ENGINE_INTEGRATION
         | DESKTOP_HOOKCONTROL
 #endif
         , &security);
-    LocalFree(descriptor);
     if (!desktop || !SetThreadDesktop(desktop)) {
         std::fprintf(stderr, "Cannot isolate tests; refusing to run: %lu\n", GetLastError());
         if (desktop) CloseDesktop(desktop);

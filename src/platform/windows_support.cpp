@@ -100,15 +100,14 @@ struct LayoutApplier::Impl {
     ITfInputProcessorProfiles* profiles = nullptr;
     ITfInputProcessorProfileMgr* manager = nullptr;
     HRESULT threadResult = E_UNEXPECTED, profilesResult = E_UNEXPECTED, managerResult = E_UNEXPECTED;
-    bool activated = false;
     Impl() {
+        // ChangeCurrentLanguage needs a thread manager, but this background
+        // controller is not a TSF text client. Do not Activate it: on the
+        // two-STA regression it makes the first foreign layout handler wait
+        // on a mutex owned by this process. Creating the manager is sufficient
+        // for ChangeCurrentLanguage and FORSESSION ActivateProfile (verified).
         threadResult = CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER,
             IID_ITfThreadMgr, reinterpret_cast<void**>(&threadManager));
-        if (SUCCEEDED(threadResult)) {
-            TfClientId client = 0;
-            threadResult = threadManager->Activate(&client);
-            activated = SUCCEEDED(threadResult);
-        }
         profilesResult = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
             IID_ITfInputProcessorProfiles, reinterpret_cast<void**>(&profiles));
         if (SUCCEEDED(profilesResult)) managerResult = profiles->QueryInterface(
@@ -117,7 +116,6 @@ struct LayoutApplier::Impl {
     ~Impl() {
         if (manager) manager->Release();
         if (profiles) profiles->Release();
-        if (activated) threadManager->Deactivate();
         if (threadManager) threadManager->Release();
     }
 };

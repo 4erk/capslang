@@ -54,7 +54,8 @@ struct LayoutRequestResult {
 LayoutRequestResult RequestLayout(const LayoutTarget& target, HKL layout);
 
 // Construct/use/destroy on one initialized COM STA, before CoUninitialize.
-// Keep TSF activation alive for the worker lifetime, not per keystroke.
+// Keep TSF objects on the worker for its lifetime, not per keystroke. This
+// layout controller creates a ThreadMgr but does not activate a text client.
 class LayoutApplier {
 public:
     LayoutApplier();

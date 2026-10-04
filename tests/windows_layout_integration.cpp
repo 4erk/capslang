@@ -3,6 +3,7 @@
 #include "../src/platform/windows_support.hpp"
 #include <objbase.h>
 #include <sddl.h>
+#include <wct.h>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -84,6 +85,36 @@ bool PumpUntil(const std::function<bool()>& done, DWORD timeout = 1200) {
     } while (GetTickCount64() - start < timeout);
     return done();
 }
+
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+// Read only our test fixture's wait chain on failure. Never collect object
+// names, window titles or user input. Lack of debug privilege is reported.
+void PrintFixtureWait(DWORD tid, DWORD otherFixture) {
+    // LLVM-MinGW declares WCT APIs but omits these constants from the SDK.
+    // microsoft/win32metadata: generation/WinSDK/RecompiledIdlHeaders/um/wct.h
+    constexpr DWORD maxNodes = 16, outOfProcess = 0x1;
+    HWCT session = OpenThreadWaitChainSession(0, nullptr);
+    if (!session) { std::printf("Wait chain unavailable: %lu\n", GetLastError()); return; }
+    WAITCHAIN_NODE_INFO nodes[maxNodes]{};
+    DWORD count = maxNodes;
+    BOOL cycle = FALSE;
+    const bool ok = GetThreadWaitChain(session, 0, outOfProcess, tid, &count, nodes, &cycle) != FALSE;
+    const DWORD error = ok ? 0 : GetLastError();
+    std::printf("Fixture wait chain: ok=%d error=%lu cycle=%d nodes=%lu test_pid=%lu test_tid=%lu other_fixture_pid=%lu\n",
+        ok, error, cycle, count, GetCurrentProcessId(), GetCurrentThreadId(), otherFixture);
+    if (ok || error == ERROR_MORE_DATA || error == ERROR_TOO_MANY_THREADS) {
+        for (DWORD i = 0; i < count && i < maxNodes; ++i) {
+            std::printf("  node=%lu type=%u status=%u", i, static_cast<unsigned>(nodes[i].ObjectType),
+                static_cast<unsigned>(nodes[i].ObjectStatus));
+            if (nodes[i].ObjectType == WctThreadType)
+                std::printf(" pid=%lu tid=%lu wait_ms=%lu", nodes[i].ThreadObject.ProcessId,
+                    nodes[i].ThreadObject.ThreadId, nodes[i].ThreadObject.WaitTime);
+            std::printf("\n");
+        }
+    }
+    CloseThreadWaitChainSession(session);
+}
+#endif
 
 struct FixtureSecurity {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -481,6 +512,8 @@ void Tests(const std::wstring& desktop) {
                 static_cast<unsigned long>(result.activateProfile), result.posted, result.postError, TargetLanguage(target));
         }
         Check(result.posted && verified, "absolute language reaches real foreign window");
+        Check(result.threadManager == S_OK && result.changeLanguage == S_OK && result.activateProfile == S_OK,
+              "TSF manager, language change and session profile succeed (not WM-only fallback)");
     }
     Check(slowest < 1000, "steady layout application avoids repeated TSF activation stalls");
     applier.Request(target, en);
@@ -581,6 +614,7 @@ void EngineTests(const std::wstring& desktop) {
                 first.data->requests, first.data->changes, first.data->mode, first.data->handlingLayout,
                 static_cast<unsigned long long>(GetTickCount64() - first.data->layoutEntered),
                 static_cast<unsigned long long>(GetTickCount64() - first.data->layoutReturned));
+            PrintFixtureWait(first.data->tid, second.data->pid);
         }
         Check(applied, "production engine confirms absolute language in foreign process");
     }
@@ -682,7 +716,13 @@ int wmain(int argc, wchar_t** argv) {
     }
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (SUCCEEDED(com) && FindLayout(kEnglish) && FindLayout(kRussian)) {
+#ifdef CAPSLANG_ENGINE_INTEGRATION
+        // Diagnostic A/B only: defaults retain the full regression suite.
+        // Does a prior TSF manager on the harness STA affect the worker STA?
+        if (!(argc == 2 && wcscmp(argv[1], L"--engine-only") == 0)) Tests(name);
+#else
         Tests(name);
+#endif
 #ifdef CAPSLANG_ENGINE_INTEGRATION
         EngineTests(name);
 #endif

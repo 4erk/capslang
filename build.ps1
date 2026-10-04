@@ -4,14 +4,15 @@ param(
     [switch]$Clean,
     [switch]$ProbeOnly,
     [switch]$IntegrationOnly,
-    [switch]$RuntimeTestsOnly
+    [switch]$RuntimeTestsOnly,
+    [switch]$SaverGuardOnly
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly) | Where-Object { $_ }).Count -gt 1) {
-    throw 'Choose only one of -ProbeOnly, -IntegrationOnly, -RuntimeTestsOnly.'
+if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $SaverGuardOnly) | Where-Object { $_ }).Count -gt 1) {
+    throw 'Choose only one development build mode.'
 }
 # Some WSL hosts inherit PATHEXT=.CPL. PowerShell then fails to wait for .exe
 # invocations or set LASTEXITCODE. Repair only this build process, and restore
@@ -34,7 +35,9 @@ $downloadUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$toolVe
 $expectedSha256 = 'b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35'
 
 if ($Clean) {
-    if ($IntegrationOnly -or $RuntimeTestsOnly) {
+    if ($SaverGuardOnly) {
+        Remove-Item -LiteralPath (Join-Path $buildDir 'saver-guard') -Recurse -Force -ErrorAction SilentlyContinue
+    } elseif ($IntegrationOnly -or $RuntimeTestsOnly) {
         Remove-Item -LiteralPath $integrationDir -Recurse -Force -ErrorAction SilentlyContinue
     } elseif ($ProbeOnly) {
         Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -71,6 +74,19 @@ if (-not (Test-Path -LiteralPath $compiler)) {
 }
 if (-not (Test-Path -LiteralPath $windres)) {
     throw "Resource compiler not found after extraction: $windres"
+}
+
+if ($SaverGuardOnly) {
+    $guardDir = Join-Path $buildDir 'saver-guard'
+    New-Item -ItemType Directory -Force -Path $guardDir | Out-Null
+    $guardExe = Join-Path $guardDir 'CapsLangMwbSaverGuard.exe'
+    & $compiler '-std=c++17' '-O2' '-DNDEBUG' '-D_WIN32_WINNT=0x0A00' '-DWINVER=0x0A00' `
+        '-static' '-Wall' '-Wextra' '-Wpedantic' '-Werror' '-Wl,--no-insert-timestamp' `
+        '-s' '-municode' '-mwindows' (Join-Path $projectRoot 'tools\mwb_saver_guard.cpp') `
+        '-o' $guardExe '-luser32' '-ladvapi32' '-lwtsapi32' '-lshell32'
+    if ($LASTEXITCODE -ne 0) { throw 'Screensaver companion compilation failed.' }
+    Write-Host "Built $guardExe. Not installed; live exercises are opt-in."
+    return
 }
 
 if ($RuntimeTestsOnly) {

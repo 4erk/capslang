@@ -74,6 +74,10 @@ public:
     Replica(Id local, Id peer, Id session, Language agreed)
         : local_(local), peer_(peer), session_(session), target_(agreed) {}
     bool Ready() const { return Nonzero(local_) && Nonzero(peer_) && local_ != peer_ && Nonzero(session_) && core::Supported(target_); }
+    bool Seed(Id author) {
+        if (!Ready() || current_.counter || (author != local_ && author != peer_)) return false;
+        current_ = {1, author}; clock_ = 1; return true;
+    }
     bool Local(Language language, Message& message) {
         if (!Ready() || !core::Supported(language) || clock_ >= std::numeric_limits<std::uint64_t>::max() - 1) return false;
         current_ = {++clock_, local_}; target_ = language; peerApplied_ = Applied::None;
@@ -100,9 +104,9 @@ public:
     bool AcceptAck(const Message& message) {
         if (!Ready() || !Valid(message) || message.kind != Kind::Ack || message.session != session_ ||
             !(message.version == current_) || message.language != target_) return false;
-        // TCP/TLS preserves order. Pending is an initial status, not a later
-        // downgrade; a failure/lock can legitimately follow Applied.
-        if (message.applied == Applied::Pending && peerApplied_ != Applied::None && peerApplied_ != Applied::Pending) return false;
+        // This connection has one ordered TLS writer. A later Pending can be
+        // a real focus/unlock reapplication of the SAME language version; do
+        // not leave a stale green Applied status while the new window waits.
         peerApplied_ = message.applied;
         return true;
     }

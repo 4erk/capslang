@@ -150,13 +150,21 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags (Join-Path $projectRoot 'tests\reconnect_tests.cpp') '-o' $reconnect
     if ($LASTEXITCODE -ne 0) { throw 'Reconnect policy compilation failed.' }
     Invoke-BoundedTest $reconnect
+    $broker = Join-Path $integrationDir 'broker_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\broker_tests.cpp') '-o' $broker
+    if ($LASTEXITCODE -ne 0) { throw 'Broker state compilation failed.' }
+    Invoke-BoundedTest $broker
     $engine = Join-Path $integrationDir 'windows_engine_integration.exe'
     & $compiler @flags '-municode' '-DCAPSLANG_ENGINE_INTEGRATION' `
         (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') $platform `
         (Join-Path $projectRoot 'src\runtime\engine.cpp') (Join-Path $projectRoot 'src\platform\mwb.cpp') `
         (Join-Path $projectRoot 'src\runtime\engine_host.cpp') `
+        (Join-Path $projectRoot 'src\runtime\engine_client.cpp') `
+        (Join-Path $projectRoot 'src\network\session.cpp') (Join-Path $projectRoot 'src\network\lan.cpp') `
+        (Join-Path $projectRoot 'src\network\pairing.cpp') (Join-Path $projectRoot 'src\network\tls.cpp') `
+        (Join-Path $projectRoot 'src\platform\private_store.cpp') `
         (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
-        '-o' $engine @libs '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32' '-lbcrypt'
+        '-o' $engine @libs '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32' '-lbcrypt' '-lws2_32' '-liphlpapi' '-lsecur32' '-lncrypt'
     if ($LASTEXITCODE -ne 0) { throw 'Engine integration compilation failed.' }
     Invoke-BoundedTest $engine
     $ipc = Join-Path $integrationDir 'windows_ipc_tests.exe'
@@ -167,9 +175,32 @@ if ($RuntimeTestsOnly) {
     $tls = Join-Path $integrationDir 'windows_tls_tests.exe'
     & $compiler @flags '-municode' (Join-Path $projectRoot 'tests\windows_tls_tests.cpp') `
         (Join-Path $projectRoot 'src\network\tls.cpp') (Join-Path $projectRoot 'src\platform\private_store.cpp') `
+        (Join-Path $projectRoot 'src\network\pairing.cpp') `
+        (Join-Path $projectRoot 'src\network\enrollment.cpp') `
         '-o' $tls '-lws2_32' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
     if ($LASTEXITCODE -ne 0) { throw 'TLS test compilation failed.' }
     Invoke-BoundedTest $tls
+    $lan = Join-Path $integrationDir 'windows_lan_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\windows_lan_tests.cpp') `
+        (Join-Path $projectRoot 'src\network\lan.cpp') (Join-Path $projectRoot 'src\network\pairing.cpp') `
+        (Join-Path $projectRoot 'src\network\tls.cpp') (Join-Path $projectRoot 'src\platform\private_store.cpp') `
+        '-o' $lan '-lws2_32' '-liphlpapi' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
+    if ($LASTEXITCODE -ne 0) { throw 'LAN transport test compilation failed.' }
+    Invoke-BoundedTest $lan
+    $session = Join-Path $integrationDir 'windows_session_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\windows_session_tests.cpp') `
+        (Join-Path $projectRoot 'src\network\session.cpp') (Join-Path $projectRoot 'src\network\lan.cpp') `
+        (Join-Path $projectRoot 'src\network\pairing.cpp') (Join-Path $projectRoot 'src\network\tls.cpp') `
+        (Join-Path $projectRoot 'src\platform\private_store.cpp') `
+        '-o' $session '-lws2_32' '-liphlpapi' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
+    if ($LASTEXITCODE -ne 0) { throw 'Broker session test compilation failed.' }
+    Invoke-BoundedTest $session
+    $lanProbe = Join-Path $integrationDir 'lan_pair_probe.exe'
+    & $compiler @flags '-municode' (Join-Path $projectRoot 'tools\lan_pair_probe.cpp') `
+        (Join-Path $projectRoot 'src\network\lan.cpp') (Join-Path $projectRoot 'src\network\pairing.cpp') `
+        (Join-Path $projectRoot 'src\network\tls.cpp') (Join-Path $projectRoot 'src\platform\private_store.cpp') `
+        '-o' $lanProbe '-lws2_32' '-liphlpapi' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
+    if ($LASTEXITCODE -ne 0) { throw 'Opt-in LAN probe compilation failed.' }
     # Built but NEVER automatically run: this is the only hardware-writing test.
     $led = Join-Path $integrationDir 'windows_led_integration.exe'
     & $compiler @flags '-municode' (Join-Path $projectRoot 'tests\windows_led_integration.cpp') `

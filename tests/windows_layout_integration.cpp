@@ -11,9 +11,14 @@
 #ifdef CAPSLANG_ENGINE_INTEGRATION
 #include "../src/runtime/engine.hpp"
 #include "../src/runtime/engine_host.hpp"
+#include "../src/runtime/engine_client.hpp"
+#include "../src/network/session.hpp"
+#include "../src/network/lan.hpp"
 #include "../src/platform/mwb.hpp"
 #include "../src/runtime/local_ipc.hpp"
 #include <atomic>
+#include <mutex>
+#include <thread>
 #endif
 
 using namespace capslang;
@@ -698,6 +703,130 @@ void EngineTests(const std::wstring& desktop) {
     request.engineEpoch = 0;
     Check(PumpUntil([&] { return call() && response.actual == kEnglish && response.target == kEnglish; }),
           "matching conditional update reaches actual target");
+    {
+        EngineClient client(executable, hostEndpoint, false);
+        ipc::Response sample;
+        Check(client.Read(sample), "ordinary broker client reads validated engine endpoint");
+        sync::LocalState local;
+        Check(EngineClient::MakeState(sample, 0, {}, true, local) && !local.snapshot.activity.known,
+              "broker does not invent recipient activity from IPC input counters");
+        auto malformed = sample; malformed.flags |= 128;
+        sync::LocalState invalid;
+        Check(!EngineClient::MakeState(malformed, 0, {}, true, invalid), "broker rejects unknown status flags");
+        Check(!EngineClient::MakeState(sample, 0, {0, 0, true}, true, invalid), "known activity requires actual activity serial");
+        sync::Id localId{}, peerId{}, session{}; localId[0] = 1; peerId[0] = 2; session[0] = 3;
+        sync::BrokerState broker(localId, peerId, session, Language::English, local);
+        sync::Replica peer(peerId, localId, session, Language::English);
+        sync::Message message;
+        Check(peer.Local(Language::Russian, message) && broker.Remote(message, local, GetTickCount64()),
+              "broker receives exact peer target");
+        auto actions = broker.TakeOutput();
+        Check(actions.apply && actions.acknowledgement && actions.acknowledgement->applied == sync::Applied::Pending,
+              "broker emits conditional command and pending, never premature success");
+        const bool queued = actions.apply && client.Queue(*actions.apply);
+        broker.ApplyQueued(queued);
+        Check(queued, "broker command crosses protected IPC into real engine");
+        bool confirmed = false, echoed = false;
+        Check(PumpUntil([&] {
+            if (!client.Read(sample) || !EngineClient::MakeState(sample, 0, {}, true, local) ||
+                !broker.Observe(local, GetTickCount64())) return false;
+            const auto output = broker.TakeOutput();
+            echoed |= output.update.has_value();
+            if (output.acknowledgement && output.acknowledgement->applied == sync::Applied::Yes)
+                confirmed = peer.AcceptAck(*output.acknowledgement);
+            return confirmed && TargetLanguage(second.Target()) == kRussian;
+        }), "peer confirmed only after broker->IPC->engine changes actual foreign-window language");
+        Check(!echoed && sample.revision == 0 && peer.PeerApplied() == sync::Applied::Yes,
+              "verified remote application has no local-input echo");
+        Check(!client.Queue({Language::English, epoch ^ UINT64_MAX, 0}) && client.Error() == ERROR_REVISION_MISMATCH,
+              "broker refuses command bound to stale engine incarnation");
+        EngineClient wrongBinary(L"C:\\Windows\\not-capslang.exe", hostEndpoint, false);
+        Check(!wrongBinary.Read(sample), "broker rejects endpoint hosted by a different executable");
+        if (!ProcessElevation(GetCurrentProcessId()).elevated) {
+            EngineClient needElevated(executable, hostEndpoint);
+            Check(!needElevated.Read(sample), "full-mode broker refuses non-elevated engine");
+        }
+    }
+    {
+        // Full authenticated transport -> broker -> protected IPC -> real
+        // worker -> foreign process. Activity and the opposite endpoint are
+        // controlled fixtures; no physical-recipient acceptance is implied.
+        net::Winsock winsock;
+        net::Identity serverIdentity, peerIdentity; DWORD networkError = 0;
+        bool prepared = !winsock.Error() && serverIdentity.Generate(networkError) && peerIdentity.Generate(networkError);
+        net::Socket listener(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+        sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int length = sizeof(address);
+        prepared = prepared && listener && !bind(listener.Get(), reinterpret_cast<sockaddr*>(&address), length) &&
+            !listen(listener.Get(), 1) && !getsockname(listener.Get(), reinterpret_cast<sockaddr*>(&address), &length);
+        net::Socket connector(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+        prepared = prepared && connector && !connect(connector.Get(), reinterpret_cast<sockaddr*>(&address), length);
+        net::Socket accepted(prepared ? accept(listener.Get(), nullptr, nullptr) : INVALID_SOCKET);
+        HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        prepared = prepared && accepted && cancel;
+        Check(prepared, "full broker/engine network fixture prepared on loopback");
+        if (prepared) {
+            std::mutex peerStatusMutex;
+            net::SessionStatus peerStatus;
+            std::atomic<bool> changePeer{false};
+            DWORD serverResult = 0, peerResult = 0;
+            bool serverAuthenticated = false, peerAuthenticated = false;
+            const auto origin = GetTickCount64();
+            std::thread server([&] {
+                EngineClient client(executable, hostEndpoint, false);
+                net::TlsChannel channel(accepted.Get(), cancel);
+                serverAuthenticated = channel.Handshake(serverIdentity, true, peerIdentity.Fingerprint());
+                if (serverAuthenticated) {
+                    net::SessionEndpoint endpoint{
+                        [&](sync::LocalState& value) {
+                            ipc::Response valueFromEngine;
+                            const auto age = 10000 + GetTickCount64() - origin;
+                            return client.Read(valueFromEngine) && EngineClient::MakeState(valueFromEngine, 1, {age, age, true}, true, value);
+                        },
+                        [&](const sync::ApplyCommand& command) { return client.Queue(command); }, {}};
+                    net::RunSession(channel, serverIdentity, true, endpoint, cancel, serverResult);
+                } else serverResult = channel.Error();
+                shutdown(accepted.Get(), SD_BOTH);
+            });
+            std::thread peer([&] {
+                net::TlsChannel channel(connector.Get(), cancel);
+                peerAuthenticated = channel.Handshake(peerIdentity, false, serverIdentity.Fingerprint());
+                if (peerAuthenticated) {
+                    sync::LocalState state{{27, 0, 1, Language::English, {0, 0, true}, true}, Language::English, ApplyState::Applied, false};
+                    net::SessionEndpoint endpoint{
+                        [&](sync::LocalState& value) {
+                            if (changePeer.load() && !state.snapshot.userRevision) {
+                                state.snapshot.userRevision = 1; state.snapshot.activitySerial = 2;
+                                state.actual = state.snapshot.language = Language::Russian;
+                            }
+                            value = state; const auto age = GetTickCount64() - origin;
+                            value.snapshot.activity = {age, age, true}; return true;
+                        },
+                        [&](const sync::ApplyCommand& command) {
+                            if (state.snapshot.engineEpoch != command.engineEpoch || state.snapshot.userRevision != command.expectedRevision) return false;
+                            state.snapshot.language = state.actual = command.language; return true;
+                        },
+                        [&](const net::SessionStatus& value) { std::lock_guard<std::mutex> lock(peerStatusMutex); peerStatus = value; }};
+                    net::RunSession(channel, peerIdentity, false, endpoint, cancel, peerResult);
+                } else peerResult = channel.Error();
+                shutdown(connector.Get(), SD_BOTH);
+            });
+            auto peerConfirmed = [&](Language language) {
+                std::lock_guard<std::mutex> lock(peerStatusMutex);
+                return peerStatus.phase == net::SessionPhase::Active && peerStatus.target == language &&
+                    peerStatus.peerApplied == sync::Applied::Yes && TargetLanguage(second.Target()) == static_cast<LANGID>(language);
+            };
+            Check(PumpUntil([&] { return peerConfirmed(Language::English); }, 5000),
+                  "real TLS reconciliation applies EN through broker and IPC, confirmed by foreign window");
+            changePeer = true;
+            Check(PumpUntil([&] { return peerConfirmed(Language::Russian); }, 2000),
+                  "live peer update applies RU through full network-to-engine chain without synthetic keys");
+            SetEvent(cancel); server.join(); peer.join();
+            Check(serverAuthenticated && peerAuthenticated, "full engine path uses mutually pinned certificates");
+            std::printf("Full-chain stop: server=%lu peer=%lu (cancellation/disconnect expected)\n", serverResult, peerResult);
+        }
+        if (cancel) CloseHandle(cancel);
+    }
     request.operation = ipc::Operation::Stop;
     Check(call() && WaitForSingleObject(host.ShutdownEvent(), 0) == WAIT_OBJECT_0,
           "stop request signals the owner without joining IPC from its own callback");

@@ -15,7 +15,8 @@ int main() {
     check(!right.Acknowledge(Applied::Yes, Language::English, ack), "receipt cannot masquerade as applied layout");
     check(right.Acknowledge(Applied::Pending, Language::English, ack) && left.AcceptAck(ack) && left.PeerApplied() == Applied::Pending, "pending application distinct from success");
     check(right.Acknowledge(Applied::Yes, Language::Russian, ack) && left.AcceptAck(ack) && left.PeerApplied() == Applied::Yes, "actual matching language acknowledges success");
-    check(right.Acknowledge(Applied::Pending, Language::English, ack) && !left.AcceptAck(ack), "late pending cannot overwrite final status");
+    check(right.Acknowledge(Applied::Pending, Language::English, ack) && left.AcceptAck(ack) && left.PeerApplied() == Applied::Pending,
+        "ordered pending after focus or unlock revokes earlier applied status");
     check(right.Acknowledge(Applied::Failed, Language::English, ack) && left.AcceptAck(ack) && left.PeerApplied() == Applied::Failed, "application failure visible");
     check(right.Acknowledge(Applied::Locked, Language::English, ack) && left.AcceptAck(ack), "locked desktop explicit");
     check(left.Local(Language::English, second) && !left.AcceptAck(ack), "stale acknowledgement rejected");

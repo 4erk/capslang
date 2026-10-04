@@ -47,7 +47,7 @@ the requested actual language; failure and lock remain explicit. A stale ack
 cannot acknowledge a newer request. Focus changes and own applications must
 not call `Replica::Local` as new user changes.
 
-## Reconnection contract (broker not implemented yet)
+## Reconnection contract
 
 Do not replay an old session's counters after restart/reconnection. Before
 constructing a new replica, the broker must reconcile actual recipient activity,
@@ -59,9 +59,59 @@ clocks from two devices. A remote age reported at reply-send time has interval
 `[age, age + measured RTT]` at receipt. The helper selects a winner only when the
 intervals are separated by more than 100 ms. Missing, malformed, or overlapping
 ages return AwaitInput. A coordinator still has to reject stale measurements,
-confirm the proposal and handle fresh input racing that proposal; this helper
-does not implement that negotiation. After ambiguity, fresh *delivered* input
+confirm the proposal and handle fresh input racing that proposal. The helper
+alone does not implement that negotiation; `network/session.cpp` now does.
+After ambiguity, fresh *delivered* input
 must decide the language, not an arbitrary preference for the PC.
+
+## Broker control v1 (development)
+
+`core/session_wire.hpp` wraps negotiation and ordered polling in canonical
+256-byte CLBP frames. Header: magic/version/kind/flags/reserved (8 bytes), random
+connection ID (16), monotonically increasing round (8). Two 48-byte snapshot
+slots contain engine incarnation, local intent revision, activity serial,
+monotonic age bounds, EN/RU, activity-known and MWB-enabled booleans. An Offer
+uses the second snapshot and an authority/target field. Poll/PollReply instead
+carry zero or one CLSP Update and zero or one CLSP Ack in the final 128 bytes.
+All unused bytes must be zero; decoding is checked by canonical re-encoding.
+
+The listener coordinates Hello/Sample/Offer/Accepted/Commit/Committed, but its
+language has no priority. Each side rechecks its own revision/engine before
+commit. Ambiguous histories exchange fresh samples without applying anything.
+The agreed version is seeded on both ends with the same author; this allows
+actual initial application acknowledgements without inventing a user event.
+After agreement, a 100 ms request/reply loop transports the newest local intent
+and application status. There is one writer per TLS stream. Pending after an
+earlier Applied is allowed: focus/unlock can require reapplying the same target.
+Old-version/session acknowledgements cannot confirm newer work.
+
+`runtime/engine_client` validates the local engine path, SID/session and required
+elevation. Only SetLayoutIfRevision is used for peer updates. Queue success is
+not Applied: `core/broker` requires matching target, actual language and worker
+Applied status. Engine restart, MWB shutdown and disconnect invalidate the
+session. The network worker never shares the keyboard callback thread.
+
+Recipient activity remains an explicit dependency, **not** inferred from any
+injected mouse event or `hDevice != nullptr`. The production recipient observer,
+UI, installer and two-machine physical acceptance are still incomplete.
+
+## Pairing and LAN transport (development)
+
+`network/pairing` and `network/enrollment` implement a five-minute, single-use
+128-bit invitation, user confirmation bound to the exact TLS peer certificate,
+strict CLEP messages, and DPAPI pair records. The unpinned invitation connection
+cannot carry language state. After confirmation, reconnect using mutual pins.
+A lost final pairing acknowledgement is repaired by mutual-pin Resume rather
+than rolling back an already-approved peer or accepting a different one.
+Invitation strings/proofs must never be logged or put in diagnostic exports.
+
+`network/lan` uses cancellable asynchronous DNS, bounded socket operations and
+exclusive binding. Both directions reject peers outside physical Ethernet/Wi-Fi
+on-link prefixes. The connector additionally checks the system's selected route;
+it does not override a VPN route. This is additional enforcement, not a substitute
+for the eventual narrowly scoped installer firewall rule. Local tests do not
+install such a rule. API references: [GetAdaptersAddresses](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getadaptersaddresses)
+and [Microsoft asynchronous resolver example](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/DNSAsyncNetworkNameResolution/cpp/ResolveName.cpp).
 
 ## Local certificate persistence
 

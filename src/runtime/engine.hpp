@@ -10,6 +10,9 @@ struct EngineStatus {
     core::ApplyState apply = core::ApplyState::Idle;
     std::uint64_t generation = 0, userRevision = 0, recoveries = 0, lastRecovery = 0;
     std::uint64_t lastPhysicalInput = 0, lastInjectedKeyInput = 0;
+    std::uint64_t activitySerial = 0, lastRecipientInput = 0;
+    DWORD mwbError = ERROR_NOT_READY;
+    bool mwbRunning = false, recipientAvailable = false;
     DWORD hookError = 0, powerError = 0, sessionError = 0, layoutError = 0, ledError = 0;
     unsigned ledWritten = 0, ledUnsupported = 0;
     bool elevated = false, hookRegistered = false, hookThreadResponsive = false, locked = false;

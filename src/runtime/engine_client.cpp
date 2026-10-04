@@ -19,13 +19,37 @@ bool EngineClient::Queue(const sync::ApplyCommand& command) {
     if (!ipc::Call(endpoint_, executable_, elevated_, request, result, error_)) return false;
     error_ = result.error; return !error_;
 }
+bool EngineClient::ReadState(sync::LocalState& result) {
+    const auto start = GetTickCount64();
+    ipc::Response response;
+    if (!Read(response)) { result = {}; return false; }
+    if (!RecipientState(response, GetTickCount64()-start, result)) { error_ = ERROR_INVALID_DATA; return false; }
+    return true;
+}
+bool EngineClient::RecipientState(const ipc::Response& response, std::uint64_t roundTrip,
+                                 sync::LocalState& output) {
+    output = {};
+    if (roundTrip > 3000 || (response.mwbFlags & ~3U) ||
+        ((response.mwbFlags & ipc::RecipientAvailable) && !(response.mwbFlags & ipc::MwbRunning)) ||
+        ((response.activitySerial == 0) != (response.activityAge == UINT64_MAX))) return false;
+    sync::Age age;
+    if (response.activitySerial) {
+        if (response.activityAge > UINT64_MAX-roundTrip) return false;
+        // Timestamp originates at input delivery, not broker observation. IPC
+        // latency widens the age interval; wall clocks are never compared.
+        age = {response.activityAge, response.activityAge+roundTrip, true};
+    }
+    const bool enabled = response.mwbFlags == (ipc::MwbRunning | ipc::RecipientAvailable);
+    return MakeState(response,response.activitySerial,age,enabled,output);
+}
 bool EngineClient::MakeState(const ipc::Response& response, std::uint64_t activitySerial,
                              sync::Age activity, bool mwb, sync::LocalState& output) {
     output = {};
     if (response.magic != ipc::kMagic || response.version != ipc::kVersion || response.error ||
         !response.engineEpoch || response.target > UINT16_MAX || response.actual > UINT16_MAX ||
         !core::Supported(static_cast<core::Language>(response.target)) ||
-        response.apply > static_cast<std::uint32_t>(core::ApplyState::Locked) || (response.flags & ~63U)) return false;
+        response.apply > static_cast<std::uint32_t>(core::ApplyState::Locked) || (response.flags & ~63U) ||
+        (response.mwbFlags & ~3U)) return false;
     sync::LocalState value;
     value.snapshot = {response.engineEpoch, response.revision, activitySerial,
         static_cast<core::Language>(response.target), activity, mwb};

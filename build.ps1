@@ -86,6 +86,7 @@ if ($RecipientProbeOnly) {
     & $compiler '-std=c++17' '-O2' '-DNDEBUG' '-D_WIN32_WINNT=0x0A00' '-DWINVER=0x0A00' `
         '-static' '-s' '-Wall' '-Wextra' '-Wpedantic' '-Werror' '-Wl,--no-insert-timestamp' `
         (Join-Path $projectRoot 'tools\mwb_recipient_probe.cpp') `
+        (Join-Path $projectRoot 'src\runtime\mwb_monitor.cpp') `
         (Join-Path $projectRoot 'src\platform\mwb.cpp') (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
         '-o' $recipientExe '-lole32' '-luuid' '-luser32' '-ladvapi32' '-lsetupapi' `
         '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32'
@@ -142,6 +143,24 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags (Join-Path $projectRoot 'tests\core_tests.cpp') '-o' $core
     if ($LASTEXITCODE -ne 0) { throw 'Core test compilation failed.' }
     Invoke-BoundedTest $core
+    $settingsTest = Join-Path $integrationDir 'settings_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\settings_tests.cpp') '-o' $settingsTest
+    if ($LASTEXITCODE -ne 0) { throw 'Selective settings test compilation failed.' }
+    Invoke-BoundedTest $settingsTest
+    $recipientTest = Join-Path $integrationDir 'recipient_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\recipient_tests.cpp') '-o' $recipientTest
+    if ($LASTEXITCODE -ne 0) { throw 'Recipient policy compilation failed.' }
+    Invoke-BoundedTest $recipientTest
+    $recipientAdapterTest = Join-Path $integrationDir 'windows_recipient_input_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\windows_recipient_input_tests.cpp') '-o' $recipientAdapterTest
+    if ($LASTEXITCODE -ne 0) { throw 'Recipient adapter compilation failed.' }
+    Invoke-BoundedTest $recipientAdapterTest
+    $mwbMonitorTest = Join-Path $integrationDir 'windows_mwb_monitor_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\windows_mwb_monitor_tests.cpp') `
+        (Join-Path $projectRoot 'src\runtime\mwb_monitor.cpp') (Join-Path $projectRoot 'src\platform\mwb.cpp') `
+        $platform '-o' $mwbMonitorTest @libs '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32'
+    if ($LASTEXITCODE -ne 0) { throw 'MWB monitor compilation failed.' }
+    Invoke-BoundedTest $mwbMonitorTest
     $sync = Join-Path $integrationDir 'sync_tests.exe'
     & $compiler @flags (Join-Path $projectRoot 'tests\sync_tests.cpp') '-o' $sync
     if ($LASTEXITCODE -ne 0) { throw 'Sync protocol compilation failed.' }
@@ -158,6 +177,7 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags '-municode' '-DCAPSLANG_ENGINE_INTEGRATION' `
         (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') $platform `
         (Join-Path $projectRoot 'src\runtime\engine.cpp') (Join-Path $projectRoot 'src\platform\mwb.cpp') `
+        (Join-Path $projectRoot 'src\runtime\mwb_monitor.cpp') `
         (Join-Path $projectRoot 'src\runtime\led_worker.cpp') `
         (Join-Path $projectRoot 'src\runtime\engine_host.cpp') `
         (Join-Path $projectRoot 'src\runtime\engine_client.cpp') `

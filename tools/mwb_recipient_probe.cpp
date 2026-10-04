@@ -1,10 +1,11 @@
 // Diagnostic only: never swallows input, changes layout, sends input or opens
-// MWB settings/memory. Records aggregate counts/ages and routing metadata only.
+// MWB memory. Selectively reads safety booleans; records aggregate counts/ages
+// and routing metadata only. It never prints unrelated MWB settings.
 #include "../src/platform/mwb.hpp"
+#include "../src/runtime/recipient_input.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstring>
-#include <mutex>
 #include <thread>
 
 namespace {
@@ -18,6 +19,7 @@ std::atomic<unsigned long> originHardware{0}, originInjected{0}, originSystem{0}
 bool deliveryWindow = false;
 bool finished = false; // Window/pump thread only.
 HHOOK keyboard = nullptr, mouse = nullptr;
+capslang::RecipientInput recipient;
 
 // Compare names locally; don't publish desktop names or window contents.
 int InputDesktopMatches(DWORD pumpThread, DWORD& error) {
@@ -45,6 +47,9 @@ LRESULT CALLBACK Keyboard(int code, WPARAM wp, LPARAM lp) {
     const LRESULT next = CallNextHookEx(nullptr, code, wp, lp);
     if (code == HC_ACTION) {
         const auto& data = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+        recipient.Key(wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN, (data.flags & LLKHF_INJECTED) != 0,
+            next == 0, data.dwExtraInfo == 0x434150534c414e47ULL || data.dwExtraInfo == 0x4341505350524f42ULL,
+            data.time, GetTickCount64());
         if (data.flags & LLKHF_INJECTED) {
             ++injected;
             if (data.dwExtraInfo == 0x434150534c414e47ULL || data.dwExtraInfo == 0x4341505350524f42ULL)
@@ -59,6 +64,8 @@ LRESULT CALLBACK Mouse(int code, WPARAM wp, LPARAM lp) {
     const LRESULT next = CallNextHookEx(nullptr, code, wp, lp);
     if (code == HC_ACTION) {
         const auto& data = *reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
+        recipient.Mouse(data.time, GetTickCount64(), (data.flags & LLMHF_INJECTED) != 0, next == 0,
+            data.dwExtraInfo == 0x434150534c414e47ULL || data.dwExtraInfo == 0x4341505350524f42ULL);
         if (data.flags & LLMHF_INJECTED) ++injected;
         else if (next) ++physicalConsumed;
         else ++physicalPassed;
@@ -107,6 +114,7 @@ LRESULT CALLBACK Window(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                     input.header.dwType == RIM_TYPEMOUSE) {
                     if (input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) ++rawAbsolute;
                     else ++rawRelative;
+                    recipient.RawMouse(input, static_cast<DWORD>(GetMessageTime()), GetTickCount64());
                 } else ++rawReadErrors;
                 SecureZeroMemory(&input, sizeof(input));
             }
@@ -116,9 +124,11 @@ LRESULT CALLBACK Window(HWND window, UINT message, WPARAM wp, LPARAM lp) {
 }
 }
 int main(int argc, char** argv) {
+    bool recipientCheck = false;
     if (argc == 2 && std::strcmp(argv[1], "--delivery-window") == 0) deliveryWindow = true;
+    else if (argc == 2 && std::strcmp(argv[1], "--recipient-check") == 0) recipientCheck = true;
     else if (argc != 1) return 6;
-    const ULONGLONG duration = deliveryWindow ? 180000 : 90000;
+    const ULONGLONG duration = recipientCheck ? 300000 : deliveryWindow ? 180000 : 90000;
     DWORD sid = 0; ProcessIdToSessionId(GetCurrentProcessId(), &sid);
     WNDCLASSW cls{}; cls.hInstance = GetModuleHandleW(nullptr);
     cls.lpszClassName = L"CapsLang.MwbRecipientEvidence"; cls.lpfnWndProc = Window;
@@ -139,22 +149,12 @@ int main(int argc, char** argv) {
         if (mouse) UnhookWindowsHookEx(mouse);
         return 4;
     }
-    // Signature/process discovery is not allowed to stall the hook pump. A
-    // stalled observer reports old metadata age rather than removing our hook.
-    std::mutex observationMutex;
-    capslang::MwbEvidence observation;
-    ULONGLONG observedAt = 0;
+    capslang::MwbMonitor monitor;
     HANDLE observerStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!observerStop) {
+    if (!observerStop || !monitor.Start()) {
+        if (observerStop) CloseHandle(observerStop);
         UnhookWindowsHookEx(keyboard); UnhookWindowsHookEx(mouse); DestroyWindow(window); return 5;
     }
-    std::thread observationThread([&] {
-        capslang::MwbObserver observer;
-        do {
-            const auto evidence = observer.Read();
-            { std::lock_guard<std::mutex> guard(observationMutex); observation = evidence; observedAt = GetTickCount64(); }
-        } while (WaitForSingleObject(observerStop, 250) == WAIT_TIMEOUT);
-    });
     const auto started = GetTickCount64();
     const DWORD pumpThread = GetCurrentThreadId();
     // Disk/pipe stdout can stall. Keep ALL formatting/flushing off the hook
@@ -163,17 +163,22 @@ int main(int argc, char** argv) {
     std::thread logger([&] {
         std::printf("session=%lu elevated=%d delivery_window=%d duration_ms=%llu; diagnostic only\n", sid,
             capslang::ProcessElevation(GetCurrentProcessId()).elevated, deliveryWindow, duration);
+        ULONGLONG nextLog = 0;
         do {
             const auto now = GetTickCount64();
-            capslang::MwbEvidence evidence; ULONGLONG observationTick = 0;
-            { std::lock_guard<std::mutex> guard(observationMutex); evidence = observation; observationTick = observedAt; }
-            const auto last = rawLast.load();
+            const auto observation = monitor.Status();
+            const auto evidence = observation.evidence;
+            const auto observationTick = observation.observedAt;
             DWORD desktopError = 0;
             const int sameDesktop = InputDesktopMatches(pumpThread, desktopError);
+            recipient.Sample(observation, now, sameDesktop != 1);
+            if (now < nextLog) continue;
+            nextLog = now + 1000;
+            const auto last = rawLast.load();
             LASTINPUTINFO lastInput{sizeof(LASTINPUTINFO), 0};
             const bool lastInputKnown = GetLastInputInfo(&lastInput) != FALSE;
             const DWORD inputAge = lastInputKnown ? GetTickCount() - lastInput.dwTime : MAXDWORD;
-            std::printf("t=%llu route=%u apps=%u dots=%u supported=%d error=%lu raw_mouse=%lu raw_key=%lu raw_age=%llu passed=%lu consumed=%lu injected=%lu own_injected=%lu raw_absolute=%lu raw_relative=%lu raw_null=%lu raw_errors=%lu route_age=%llu desktop_match=%d desktop_error=%lu input_known=%d input_age=%lu delivered_move=%lu delivered_click=%lu delivered_key=%lu origin_hardware=%lu origin_injected=%lu origin_system=%lu origin_unknown=%lu\n",
+            std::printf("t=%llu route=%u apps=%u dots=%u supported=%d error=%lu raw_mouse=%lu raw_key=%lu raw_age=%llu passed=%lu consumed=%lu injected=%lu own_injected=%lu raw_absolute=%lu raw_relative=%lu raw_null=%lu raw_errors=%lu route_age=%llu desktop_match=%d desktop_error=%lu input_known=%d input_age=%lu delivered_move=%lu delivered_click=%lu delivered_key=%lu origin_hardware=%lu origin_injected=%lu origin_system=%lu origin_unknown=%lu settings_known=%d maintenance_input=%d observation_allowed=%d\n",
                 static_cast<unsigned long long>(now - started), static_cast<unsigned>(evidence.route),
                 evidence.applications, evidence.dots, evidence.supportedBinary, evidence.error,
                 rawMouse.load(), rawKeyboard.load(), static_cast<unsigned long long>(last && now >= last ? now - last : UINT64_MAX),
@@ -182,9 +187,19 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(observationTick && observationTick <= now ? now - observationTick : UINT64_MAX),
                 sameDesktop, desktopError, lastInputKnown, inputAge,
                 deliveredMoves.load(), deliveredClicks.load(), deliveredKeys.load(),
-                originHardware.load(), originInjected.load(), originSystem.load(), originUnknown.load());
+                originHardware.load(), originInjected.load(), originSystem.load(), originUnknown.load(),
+                evidence.settings.known, evidence.settings.maintenanceInput, evidence.RecipientObservationAllowed());
+            const auto recipientLast = recipient.State().Last();
+            std::printf("recipient_serial=%llu age=%llu physical_key=%llu injected_key=%llu physical_mouse=%llu injected_mouse=%llu dropped=%llu observer_responsive=%d\n",
+                static_cast<unsigned long long>(recipient.State().Serial()),
+                static_cast<unsigned long long>(recipientLast && recipientLast <= now ? now-recipientLast : UINT64_MAX),
+                static_cast<unsigned long long>(recipient.Accepted(capslang::core::DeliveredKind::PhysicalKey)),
+                static_cast<unsigned long long>(recipient.Accepted(capslang::core::DeliveredKind::InjectedKey)),
+                static_cast<unsigned long long>(recipient.Accepted(capslang::core::DeliveredKind::PhysicalMouse)),
+                static_cast<unsigned long long>(recipient.Accepted(capslang::core::DeliveredKind::InjectedMouse)),
+                static_cast<unsigned long long>(recipient.Dropped()), observation.responsive);
             std::fflush(stdout);
-        } while (WaitForSingleObject(observerStop, 1000) == WAIT_TIMEOUT);
+        } while (WaitForSingleObject(observerStop, 100) == WAIT_TIMEOUT);
     });
     while (!finished && GetTickCount64() - started < duration) {
         MSG message{};
@@ -195,6 +210,6 @@ int main(int argc, char** argv) {
     }
     UnhookWindowsHookEx(keyboard); UnhookWindowsHookEx(mouse);
     DestroyWindow(window);
-    SetEvent(observerStop); observationThread.join(); logger.join(); CloseHandle(observerStop);
+    SetEvent(observerStop); logger.join(); monitor.Stop(); CloseHandle(observerStop);
     return 0;
 }

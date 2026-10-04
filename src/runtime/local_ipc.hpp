@@ -5,7 +5,7 @@
 #include <memory>
 
 namespace capslang::ipc {
-constexpr std::uint32_t kMagic = 0x314c5043, kVersion = 2;
+constexpr std::uint32_t kMagic = 0x314c5043, kVersion = 3;
 enum class Operation : std::uint32_t {
     Status = 1, SetLayout = 2, RefreshHook = 3, Stop = 4, SetLayoutIfRevision = 5
 };
@@ -13,6 +13,7 @@ enum StatusFlag : std::uint32_t {
     Elevated = 1U, HookRegistered = 2U, HookResponsive = 4U, Locked = 8U,
     LedWritten = 16U, LedPartial = 32U
 };
+enum MwbFlag : std::uint32_t { MwbRunning = 1U, RecipientAvailable = 2U };
 #pragma pack(push, 1)
 struct Request {
     std::uint32_t magic = kMagic, version = kVersion;
@@ -31,9 +32,11 @@ struct Response {
     std::uint64_t generation = 0, revision = 0, recovery = 0;
     std::uint64_t physicalAge = UINT64_MAX, injectedKeyAge = UINT64_MAX;
     std::uint64_t engineEpoch = 0;
+    std::uint64_t activitySerial = 0, activityAge = UINT64_MAX;
+    std::uint32_t mwbFlags = 0, mwbError = 0;
 };
 #pragma pack(pop)
-static_assert(sizeof(Request) == 48 && sizeof(Response) == 96, "fixed wire ABI v2");
+static_assert(sizeof(Request) == 48 && sizeof(Response) == 120, "fixed wire ABI v3");
 bool Valid(const Request& request);
 struct Endpoint {
     std::wstring name, sid;

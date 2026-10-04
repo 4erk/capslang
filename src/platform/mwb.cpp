@@ -1,4 +1,5 @@
 #include "mwb.hpp"
+#include "../core/json_bool.hpp"
 #include <wtsapi32.h>
 #include <wintrust.h>
 #include <softpub.h>
@@ -54,7 +55,7 @@ bool SupportedBinary(DWORD pid, DWORD& error) {
     error = microsoft ? 0 : (result ? static_cast<DWORD>(result) : static_cast<DWORD>(TRUST_E_SUBJECT_NOT_TRUSTED));
     return microsoft;
 }
-struct Windows { DWORD pid; unsigned dots = 0; bool visible = false; };
+struct Windows { DWORD pid; unsigned dots = 0; bool visible = false; HWND window = nullptr; };
 BOOL CALLBACK Dot(HWND window, LPARAM param) {
     auto& result = *reinterpret_cast<Windows*>(param);
     DWORD pid = 0;
@@ -68,13 +69,55 @@ BOOL CALLBACK Dot(HWND window, LPARAM param) {
         (style & WS_EX_LAYERED) && (style & WS_EX_TOPMOST) &&
         GetClassNameW(window, className, ARRAYSIZE(className)) &&
         wcsncmp(className, L"WindowsForms10.", 15) == 0) {
-        ++result.dots; result.visible = IsWindowVisible(window) != FALSE;
+        ++result.dots; result.visible = IsWindowVisible(window) != FALSE; result.window = window;
     }
     return TRUE;
 }
 }
+MwbSettings ReadMwbSettings(const std::wstring& path) {
+    MwbSettings result;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) { result.error = GetLastError(); return result; }
+    BY_HANDLE_FILE_INFORMATION before{}, after{};
+    if (!GetFileInformationByHandle(file, &before)) {
+        result.error = GetLastError(); CloseHandle(file); return result;
+    }
+    if (before.nFileSizeHigh || !before.nFileSizeLow || before.nFileSizeLow > 1024 * 1024 ||
+        (before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        result.error = ERROR_INVALID_DATA; CloseHandle(file); return result;
+    }
+    std::string text(before.nFileSizeLow, '\0'); DWORD read = 0;
+    const bool ok = ReadFile(file, text.data(), static_cast<DWORD>(text.size()), &read, nullptr) &&
+        read == text.size() && GetFileInformationByHandle(file, &after) &&
+        before.nFileSizeLow == after.nFileSizeLow && before.nFileSizeHigh == after.nFileSizeHigh &&
+        CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0;
+    CloseHandle(file);
+    if (ok) {
+        const auto maintenance = core::ReadSettingBool(text, "BlockScreenSaverOnOtherMachines");
+        const auto hide = core::ReadSettingBool(text, "HideMouseAtScreenEdge");
+        const auto relative = core::ReadSettingBool(text, "MoveMouseRelatively");
+        result.known = maintenance != core::JsonBool::Unknown && hide != core::JsonBool::Unknown &&
+            relative != core::JsonBool::Unknown;
+        if (result.known) {
+            result.maintenanceInput = maintenance == core::JsonBool::True;
+            result.hideCursor = hide == core::JsonBool::True;
+            result.relativeMouse = relative == core::JsonBool::True;
+        }
+    }
+    SecureZeroMemory(text.data(), text.size());
+    result.error = result.known ? ERROR_SUCCESS : ERROR_INVALID_DATA;
+    return result;
+}
 MwbEvidence MwbObserver::Read() {
     const auto now = GetTickCount64();
+    if (now >= nextSettings_) {
+        nextSettings_ = now + 1000;
+        wchar_t root[32768]{};
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", root, ARRAYSIZE(root));
+        if (!length || length >= ARRAYSIZE(root)) { settings_ = {}; settings_.error = ERROR_PATH_NOT_FOUND; }
+        else settings_ = ReadMwbSettings(std::wstring(root) + L"\\Microsoft\\PowerToys\\MouseWithoutBorders\\settings.json");
+    }
     if (now >= nextDiscovery_) {
         nextDiscovery_ = now + 5000; helperPid_ = 0; discovered_ = {};
         DWORD session = 0;
@@ -101,10 +144,12 @@ MwbEvidence MwbObserver::Read() {
         WTSFreeMemory(entries);
     }
     auto result = discovered_;
+    result.settings = settings_; result.helperPid = helperPid_;
     if (!result.applications || result.helpers != 1 || !helperPid_ || !result.supportedBinary) return result;
     Windows windows{helperPid_};
     if (!EnumWindows(Dot, reinterpret_cast<LPARAM>(&windows))) { result.error = GetLastError(); return result; }
     result.dots = windows.dots; result.dotVisible = windows.visible;
+    result.dotWindow = windows.dots == 1 ? windows.window : nullptr;
     if (windows.dots == 1) result.route = windows.visible ? MwbRoute::RemoteCandidate : MwbRoute::LocalCandidate;
     return result;
 }

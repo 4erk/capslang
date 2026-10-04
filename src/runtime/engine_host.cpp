@@ -82,6 +82,11 @@ ipc::Response EngineHost::Handle(const ipc::Request& request) {
     response.physicalAge = Age(now, status.lastPhysicalInput);
     response.injectedKeyAge = Age(now, status.lastInjectedKeyInput);
     response.engineEpoch = epoch_;
+    response.activitySerial = status.activitySerial;
+    response.activityAge = Age(now, status.lastRecipientInput);
+    response.mwbFlags = (status.mwbRunning ? ipc::MwbRunning : 0U) |
+        (status.recipientAvailable ? ipc::RecipientAvailable : 0U);
+    response.mwbError = status.mwbError;
     // A queued SetLayout request is NOT an acknowledgement of application.
     // Broker must observe its requested target, actual AND Applied later.
     return response;

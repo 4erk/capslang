@@ -569,14 +569,14 @@ LayoutTarget CaptureFixture() {
     const DWORD tid = GetWindowThreadProcessId(window, &pid);
     return {window, window, pid, tid, GetKeyboardLayout(tid)};
 }
-HWND EngineRawSink() {
+HWND EngineRawSink(USHORT usage = 6) {
     UINT count = 0;
     if (GetRegisteredRawInputDevices(nullptr, &count, sizeof(RAWINPUTDEVICE)) != 0 || !count) return nullptr;
     std::vector<RAWINPUTDEVICE> devices(count);
     if (GetRegisteredRawInputDevices(devices.data(), &count, sizeof(RAWINPUTDEVICE)) == UINT(-1)) return nullptr;
     for (const auto& device : devices) {
         wchar_t name[128]{};
-        if (device.usUsagePage == 1 && device.usUsage == 6 && (device.dwFlags & RIDEV_INPUTSINK) &&
+        if (device.usUsagePage == 1 && device.usUsage == usage && (device.dwFlags & RIDEV_INPUTSINK) &&
             GetClassNameW(device.hwndTarget, name, ARRAYSIZE(name)) &&
             wcscmp(name, L"CapsLang.Engine.RawRelease.1.1") == 0) return device.hwndTarget;
     }
@@ -597,6 +597,7 @@ void EngineTests(const std::wstring& desktop) {
           "real low-level hooks installed and dedicated thread responsive");
     const HWND rawSink = EngineRawSink();
     Check(rawSink && !engine.Status().hookError, "dedicated hook thread registered Raw Input release observer");
+    Check(rawSink && EngineRawSink(2) == rawSink, "mouse recipient and Caps release share one owned Raw Input sink");
     const auto rawRevision = engine.Status().userRevision;
     if (rawSink) {
         DWORD_PTR ignored = 0;
@@ -674,7 +675,7 @@ void EngineTests(const std::wstring& desktop) {
     const auto stopStart = GetTickCount64();
     engine.Stop();
     Check(GetTickCount64() - stopStart < 2000 && !engine.Status().hookRegistered, "engine orderly shutdown removes hooks");
-    Check(!EngineRawSink() && !IsWindow(rawSink), "engine shutdown removes owned Raw Input registration and window");
+    Check(!EngineRawSink() && !EngineRawSink(2) && !IsWindow(rawSink), "engine shutdown removes both owned Raw Input registrations and window");
     Check(!engine.SetTarget(Language::English) && !engine.RestartHook(), "post-stop work rejected");
     const auto hostEndpoint = ipc::Endpoint::Current(L"host-test-" + std::to_wstring(GetCurrentProcessId()));
     EngineHost host(hostEndpoint, {false, CaptureFixture});
@@ -737,6 +738,23 @@ void EngineTests(const std::wstring& desktop) {
         sync::LocalState invalid;
         Check(!EngineClient::MakeState(malformed, 0, {}, true, invalid), "broker rejects unknown status flags");
         Check(!EngineClient::MakeState(sample, 0, {0, 0, true}, true, invalid), "known activity requires actual activity serial");
+        Check(client.ReadState(invalid) && !invalid.snapshot.activity.known && !invalid.snapshot.mwb,
+              "private desktop has no invented recipient or usable MWB route");
+        auto recipientSample = sample;
+        recipientSample.activitySerial = 1; recipientSample.activityAge = 10;
+        recipientSample.mwbFlags = ipc::MwbRunning | ipc::RecipientAvailable;
+        Check(EngineClient::RecipientState(recipientSample,20,invalid) && invalid.snapshot.mwb &&
+              invalid.snapshot.activity.minimum == 10 && invalid.snapshot.activity.maximum == 30,
+              "recipient age interval includes bounded IPC round trip");
+        recipientSample.mwbFlags = ipc::MwbRunning;
+        Check(EngineClient::RecipientState(recipientSample,20,invalid) && !invalid.snapshot.mwb,
+              "unsafe recipient metadata disables reconciliation despite running MWB");
+        recipientSample.mwbFlags = ipc::RecipientAvailable;
+        Check(!EngineClient::RecipientState(recipientSample,20,invalid), "available recipient without MWB rejected");
+        recipientSample.mwbFlags = 0; recipientSample.activitySerial = 0;
+        Check(!EngineClient::RecipientState(recipientSample,20,invalid), "recipient age without serial rejected");
+        recipientSample.activitySerial = 1; recipientSample.activityAge = UINT64_MAX-1;
+        Check(!EngineClient::RecipientState(recipientSample,20,invalid), "recipient age overflow rejected");
         sync::Id localId{}, peerId{}, session{}; localId[0] = 1; peerId[0] = 2; session[0] = 3;
         sync::BrokerState broker(localId, peerId, session, Language::English, local);
         sync::Replica peer(peerId, localId, session, Language::English);

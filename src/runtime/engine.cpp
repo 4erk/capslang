@@ -1,5 +1,6 @@
 #include "engine.hpp"
 #include "led_worker.hpp"
+#include "recipient_input.hpp"
 #include "../core/keyboard.hpp"
 #include <objbase.h>
 #include <wtsapi32.h>
@@ -38,6 +39,8 @@ struct Engine::Impl {
     LayoutTarget target;
     std::unique_ptr<LayoutApplier> applier;
     LedWorker leds;
+    MwbMonitor mwb;
+    RecipientInput recipient;
     HANDLE worker = nullptr, workerReady = nullptr, stopEvent = nullptr, hook = nullptr, hookReady = nullptr;
     HDESK desktop = nullptr;
     std::atomic<HWND> window{nullptr};
@@ -54,6 +57,9 @@ struct Engine::Impl {
 
     explicit Impl(EngineOptions value) : options(value) {}
     void Publish() {
+        const auto now = GetTickCount64();
+        const auto observation = mwb.Status();
+        recipient.Sample(observation, now, locked);
         std::lock_guard<std::mutex> guard(statusMutex);
         status.target = layout.Target(); status.actual = layout.Actual(); status.apply = layout.State();
         status.generation = layout.Generation(); status.userRevision = layout.UserRevision();
@@ -65,6 +71,12 @@ struct Engine::Impl {
         status.recoveries = recoveryCount.load(); status.lastRecovery = hookRecovered.load();
         status.lastPhysicalInput = physicalInput.load();
         status.lastInjectedKeyInput = injectedKeyInput.load();
+        status.activitySerial = recipient.State().Serial();
+        status.lastRecipientInput = recipient.State().Last();
+        status.mwbError = observation.error ? observation.error : observation.evidence.settings.error;
+        status.mwbRunning = observation.responsive && observation.evidence.applications;
+        status.recipientAvailable = observation.responsive && observation.evidence.RecipientObservationAllowed() &&
+            !observation.evidence.settings.relativeMouse;
     }
     void Error(DWORD EngineStatus::*field, DWORD error) {
         std::lock_guard<std::mutex> guard(statusMutex);
@@ -77,6 +89,7 @@ struct Engine::Impl {
         const auto data = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(pointer);
         const bool own = data.dwExtraInfo == kLegacyInput || data.dwExtraInfo == kLegacyProbe;
         const LRESULT next = CallNextHookEx(nullptr, code, message, pointer);
+        self->recipient.Key(Down(message), (data.flags & LLKHF_INJECTED) != 0, next == 0, own, data.time, GetTickCount64());
         // Calling the rest of the chain FIRST lets MWB forward/suppress at the
         // source regardless of hook installation order. No duplicate local toggle.
         if (own || next != 0) return next;
@@ -105,6 +118,8 @@ struct Engine::Impl {
         if (code != HC_ACTION || !self) return CallNextHookEx(nullptr, code, message, pointer);
         const auto data = *reinterpret_cast<const MSLLHOOKSTRUCT*>(pointer);
         const LRESULT next = CallNextHookEx(nullptr, code, message, pointer);
+        self->recipient.Mouse(data.time, GetTickCount64(), (data.flags & LLMHF_INJECTED) != 0, next == 0,
+            data.dwExtraInfo == kLegacyInput || data.dwExtraInfo == kLegacyProbe);
         // Synthetic mouse events alone are never authoritative activity.
         if (!next && !(data.flags & LLMHF_INJECTED)) self->physicalInput = GetTickCount64();
         return next;
@@ -114,6 +129,9 @@ struct Engine::Impl {
             RAWINPUT data{}; UINT size = sizeof(data);
             const auto count = GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT,
                 &data, &size, sizeof(RAWINPUTHEADER));
+            if (count != UINT(-1) && count >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE) &&
+                data.header.dwType == RIM_TYPEMOUSE)
+                hookOwner->recipient.RawMouse(data, static_cast<DWORD>(GetMessageTime()), GetTickCount64());
             if (count != UINT(-1) && count >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) &&
                 data.header.dwType == RIM_TYPEKEYBOARD && data.data.keyboard.VKey == VK_CAPITAL &&
                 (data.data.keyboard.Flags & RI_KEY_BREAK)) {
@@ -130,12 +148,11 @@ struct Engine::Impl {
         std::vector<RAWINPUTDEVICE> devices(count);
         if (GetRegisteredRawInputDevices(devices.data(), &count, sizeof(RAWINPUTDEVICE)) == UINT(-1)) return;
         for (const auto& device : devices) {
-            if (device.usUsagePage == 1 && device.usUsage == 6 && device.hwndTarget == hwnd) {
+            if (device.usUsagePage == 1 && (device.usUsage == 6 || device.usUsage == 2) && device.hwndTarget == hwnd) {
                 // Raw Input is process-wide. Don't unregister another owner's
                 // newer registration during a sequential/overlapping test.
-                RAWINPUTDEVICE remove{1, 6, RIDEV_REMOVE, nullptr};
+                RAWINPUTDEVICE remove{1, device.usUsage, RIDEV_REMOVE, nullptr};
                 RegisterRawInputDevices(&remove, 1, sizeof(remove));
-                break;
             }
         }
     }
@@ -155,8 +172,8 @@ struct Engine::Impl {
             HWND_MESSAGE, nullptr, rawClass.hInstance, nullptr);
         self.rawError = rawWindow ? ERROR_SUCCESS : GetLastError();
         if (rawWindow) {
-            RAWINPUTDEVICE device{1, 6, RIDEV_INPUTSINK, rawWindow};
-            if (!RegisterRawInputDevices(&device, 1, sizeof(device))) self.rawError = GetLastError();
+            RAWINPUTDEVICE devices[]{{1, 6, RIDEV_INPUTSINK, rawWindow}, {1, 2, RIDEV_INPUTSINK, rawWindow}};
+            if (!RegisterRawInputDevices(devices, 2, sizeof(devices[0]))) self.rawError = GetLastError();
         }
         HHOOK keyboard = nullptr, mouse = nullptr;
         ULONGLONG lastInstall = 0, retryAt = 0;
@@ -331,6 +348,7 @@ struct Engine::Impl {
         self.target = self.options.capture();
         self.layout.Initialize(static_cast<core::Language>(TargetLanguage(self.target)));
         self.layout.Request(self.layout.Target(), core::Origin::Startup, GetTickCount64());
+        self.mwb.Start(); // Failure disables recipient reconciliation, not local switching.
         if (self.options.hardwareLeds && !self.leds.Start(self.options.ledOperation)) self.Error(&EngineStatus::ledError, self.leds.Error());
         self.wts = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) != FALSE;
         if (!self.wts) self.Error(&EngineStatus::sessionError, GetLastError());
@@ -362,6 +380,7 @@ struct Engine::Impl {
         if (self.wts) WTSUnRegisterSessionNotification(hwnd);
         self.window = nullptr;
         if (!self.leds.Stop()) self.Error(&EngineStatus::ledError, self.leds.Error());
+        self.mwb.Stop();
         DestroyWindow(hwnd);
         self.Publish();
         self.applier.reset(); // Release TSF on its owning STA before COM shutdown.

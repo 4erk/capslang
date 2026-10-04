@@ -31,8 +31,31 @@ int main() {
     check(!keys.Caps(Edge::Down, false, false, false).toggle, "lost up does not guess new press");
     keys.Caps(Edge::Up, false, false, false);
     check(keys.Caps(Edge::Down, false, false, false).toggle, "next complete sequence recovers");
-    keys.PhysicalReleaseObserved();
+    keys.PhysicalReleaseObserved(1);
     check(!keys.Held(), "raw physical release recovers missing hook up");
+    for (bool shift : {false, true}) {
+        KeyboardState held;
+        check(held.CanRefresh(false) && !held.CanRefresh(true), "other delivered keys defer maintenance");
+        held.Caps(Edge::Down, shift, false, false, 100);
+        check(!held.CanRefresh(false), "suppressed Caps also defers maintenance with async state clear");
+        check(!held.PhysicalReleaseObserved(99) && !held.PhysicalReleaseObserved(100) && held.Held(),
+              "stale or equal-time Raw break cannot clear current press");
+        held.Caps(Edge::Down, !shift, false, false, 150);
+        check(!held.PhysicalReleaseObserved(140), "break older than repeat cannot clear an ambiguous newer down");
+        check(held.PhysicalReleaseObserved(160), "break newer than latest down releases lost-up latch");
+        check(held.CanRefresh(false), "delivered break after lost hook enables maintenance");
+        const auto fresh = held.Caps(Edge::Down, shift, false, false, 200);
+        check(fresh.toggle == !shift && fresh.suppress == !shift, "press after observed release retains Shift behavior");
+        check(!held.PhysicalReleaseObserved(140) && held.Held(), "queued old break does not clear newer press");
+        held.Caps(Edge::Up, false, false, false, 210);
+        check(!held.PhysicalReleaseObserved(211) && held.CanRefresh(false), "duplicate break after normal up is harmless");
+    }
+    KeyboardState wrap;
+    wrap.Caps(Edge::Down, false, false, false, 0xfffffff0U);
+    check(wrap.PhysicalReleaseObserved(10), "release timestamps survive DWORD clock wrap");
+    wrap.Caps(Edge::Down, false, false, false, 20);
+    check(!wrap.PhysicalReleaseObserved(0xfffffff0U) && wrap.Held(), "pre-wrap stale release is rejected");
+    check(!wrap.PhysicalReleaseObserved(0x80000014U), "half-clock distance is ambiguous");
 
     LayoutState layout;
     layout.Initialize(Language::English);

@@ -10,9 +10,11 @@ struct KeyResult { bool suppress = false; bool toggle = false; };
 // and consumed by MWB must NOT change our local Caps/Shift state.
 class KeyboardState {
 public:
-    KeyResult Caps(Edge edge, bool shift, bool own, bool consumedDownstream) {
+    KeyResult Caps(Edge edge, bool shift, bool own, bool consumedDownstream,
+                   std::uint32_t eventTime = 0) {
         if (own || consumedDownstream) return {};
         if (edge == Edge::Down) {
+            downTime_ = eventTime;
             if (held_) return {!pass_, false};
             held_ = true;
             pass_ = shift;
@@ -25,12 +27,25 @@ public:
         return {suppress, false};
     }
     bool Held() const { return held_; }
+    bool CanRefresh(bool deliveredKeyHeld) const { return !held_ && !deliveredKeyHeld; }
     // Hook replacement deliberately has no reset operation. A missing key-up
     // conservatively consumes the next repeated down until an up arrives;
     // guessing from time alone would turn keyboard repeat into double toggles.
-    void PhysicalReleaseObserved() { held_ = false; pass_ = false; }
+    // A suppressed Caps down is absent from GetAsyncKeyState. If Windows
+    // removes the hook before its up, a delivered Raw Input break can release
+    // the latch. Its message timestamp must be strictly newer than our latest down:
+    // an old queued break must not release a NEW press. Equal-time events are
+    // ambiguous, so keep the latch rather than manufacture a second toggle.
+    // Win32 input timestamps wrap at 32 bits; distances >= 2^31 are ambiguous.
+    bool PhysicalReleaseObserved(std::uint32_t eventTime) {
+        const auto elapsed = eventTime - downTime_;
+        if (!held_ || !elapsed || elapsed >= 0x80000000U) return false;
+        held_ = false; pass_ = false;
+        return true;
+    }
 private:
     bool held_ = false, pass_ = false;
+    std::uint32_t downTime_ = 0;
 };
 
 enum class Language : std::uint16_t { Unknown = 0, English = 0x0409, Russian = 0x0419 };

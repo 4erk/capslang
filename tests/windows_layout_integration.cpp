@@ -569,6 +569,19 @@ LayoutTarget CaptureFixture() {
     const DWORD tid = GetWindowThreadProcessId(window, &pid);
     return {window, window, pid, tid, GetKeyboardLayout(tid)};
 }
+HWND EngineRawSink() {
+    UINT count = 0;
+    if (GetRegisteredRawInputDevices(nullptr, &count, sizeof(RAWINPUTDEVICE)) != 0 || !count) return nullptr;
+    std::vector<RAWINPUTDEVICE> devices(count);
+    if (GetRegisteredRawInputDevices(devices.data(), &count, sizeof(RAWINPUTDEVICE)) == UINT(-1)) return nullptr;
+    for (const auto& device : devices) {
+        wchar_t name[128]{};
+        if (device.usUsagePage == 1 && device.usUsage == 6 && (device.dwFlags & RIDEV_INPUTSINK) &&
+            GetClassNameW(device.hwndTarget, name, ARRAYSIZE(name)) &&
+            wcscmp(name, L"CapsLang.Engine.RawRelease.1.1") == 0) return device.hwndTarget;
+    }
+    return nullptr;
+}
 void EngineTests(const std::wstring& desktop) {
     using core::Language;
     using core::ApplyState;
@@ -582,6 +595,15 @@ void EngineTests(const std::wstring& desktop) {
     Check(engine.Start(), "real engine worker starts on private desktop");
     Check(PumpUntil([&] { return engine.Status().hookRegistered && engine.Status().hookThreadResponsive; }),
           "real low-level hooks installed and dedicated thread responsive");
+    const HWND rawSink = EngineRawSink();
+    Check(rawSink && !engine.Status().hookError, "dedicated hook thread registered Raw Input release observer");
+    const auto rawRevision = engine.Status().userRevision;
+    if (rawSink) {
+        DWORD_PTR ignored = 0;
+        Check(SendMessageTimeoutW(rawSink, WM_INPUT, RIM_INPUTSINK, 0,
+            SMTO_ABORTIFHUNG, 1000, &ignored) != 0, "invalid Raw Input handle is handled without blocking");
+        Check(engine.Status().userRevision == rawRevision, "invalid Raw Input does not manufacture Caps input");
+    }
     {
         const auto endpoint = ipc::Endpoint::Current(L"engine-test-" + std::to_wstring(GetCurrentProcessId()));
         ipc::Server server(endpoint, [&](const ipc::Request&) {
@@ -652,6 +674,7 @@ void EngineTests(const std::wstring& desktop) {
     const auto stopStart = GetTickCount64();
     engine.Stop();
     Check(GetTickCount64() - stopStart < 2000 && !engine.Status().hookRegistered, "engine orderly shutdown removes hooks");
+    Check(!EngineRawSink() && !IsWindow(rawSink), "engine shutdown removes owned Raw Input registration and window");
     Check(!engine.SetTarget(Language::English) && !engine.RestartHook(), "post-stop work rejected");
     const auto hostEndpoint = ipc::Endpoint::Current(L"host-test-" + std::to_wstring(GetCurrentProcessId()));
     EngineHost host(hostEndpoint, {false, CaptureFixture});

@@ -16,6 +16,7 @@ constexpr UINT kStop = WM_APP + 24, kRehook = WM_APP + 25;
 constexpr UINT kConditionalSet = WM_APP + 26;
 constexpr ULONG_PTR kLegacyInput = 0x434150534c414e47ULL, kLegacyProbe = 0x4341505350524f42ULL;
 constexpr wchar_t kEngineClass[] = L"CapsLang.Engine.1.1";
+constexpr wchar_t kRawClass[] = L"CapsLang.Engine.RawRelease.1.1";
 bool Down(WPARAM message) { return message == WM_KEYDOWN || message == WM_SYSKEYDOWN; }
 bool Up(WPARAM message) { return message == WM_KEYUP || message == WM_SYSKEYUP; }
 bool IsModifier(DWORD key) {
@@ -40,7 +41,7 @@ struct Engine::Impl {
     HANDLE worker = nullptr, workerReady = nullptr, stopEvent = nullptr, hook = nullptr, hookReady = nullptr;
     HDESK desktop = nullptr;
     std::atomic<HWND> window{nullptr};
-    std::atomic<DWORD> hookThread{0}, installError{0};
+    std::atomic<DWORD> hookThread{0}, installError{0}, rawError{0};
     std::atomic<bool> stopping{false}, installed{false}, rehookRequested{false};
     std::atomic<ULONGLONG> hookBeat{0}, hookRecovered{0}, physicalInput{0}, injectedKeyInput{0};
     std::atomic<unsigned> recoveryCount{0};
@@ -58,6 +59,7 @@ struct Engine::Impl {
         status.generation = layout.Generation(); status.userRevision = layout.UserRevision();
         status.locked = locked; status.hookRegistered = installed.load();
         status.hookError = installError.load();
+        if (!status.hookError) status.hookError = rawError.load();
         const auto heartbeat = hookBeat.load();
         status.hookThreadResponsive = heartbeat && GetTickCount64() - heartbeat < 2000;
         status.recoveries = recoveryCount.load(); status.lastRecovery = hookRecovered.load();
@@ -94,7 +96,7 @@ struct Engine::Impl {
         if (data.vkCode != VK_CAPITAL) return next;
         const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         const auto decision = self->keys.Caps(Down(message) ? core::Edge::Down : core::Edge::Up,
-                                              shift, false, false);
+                                              shift, false, false, data.time);
         if (decision.toggle) PostMessageW(owner, kToggle, 0, 0);
         return decision.suppress ? 1 : next;
     }
@@ -107,6 +109,36 @@ struct Engine::Impl {
         if (!next && !(data.flags & LLMHF_INJECTED)) self->physicalInput = GetTickCount64();
         return next;
     }
+    static LRESULT CALLBACK RawRelease(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
+        if (message == WM_INPUT && hookOwner) {
+            RAWINPUT data{}; UINT size = sizeof(data);
+            const auto count = GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT,
+                &data, &size, sizeof(RAWINPUTHEADER));
+            if (count != UINT(-1) && count >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) &&
+                data.header.dwType == RIM_TYPEKEYBOARD && data.data.keyboard.VKey == VK_CAPITAL &&
+                (data.data.keyboard.Flags & RI_KEY_BREAK)) {
+                hookOwner->keys.PhysicalReleaseObserved(static_cast<DWORD>(GetMessageTime()));
+            }
+            // No ordinary key codes, text or device identifiers are retained.
+            SecureZeroMemory(&data, sizeof(data));
+        }
+        return DefWindowProcW(hwnd, message, wp, lp);
+    }
+    static void RemoveRawSink(HWND hwnd) {
+        UINT count = 0;
+        if (GetRegisteredRawInputDevices(nullptr, &count, sizeof(RAWINPUTDEVICE)) != 0 || !count) return;
+        std::vector<RAWINPUTDEVICE> devices(count);
+        if (GetRegisteredRawInputDevices(devices.data(), &count, sizeof(RAWINPUTDEVICE)) == UINT(-1)) return;
+        for (const auto& device : devices) {
+            if (device.usUsagePage == 1 && device.usUsage == 6 && device.hwndTarget == hwnd) {
+                // Raw Input is process-wide. Don't unregister another owner's
+                // newer registration during a sequential/overlapping test.
+                RAWINPUTDEVICE remove{1, 6, RIDEV_REMOVE, nullptr};
+                RegisterRawInputDevices(&remove, 1, sizeof(remove));
+                break;
+            }
+        }
+    }
     static DWORD WINAPI HookThread(void* context) {
         auto& self = *static_cast<Impl*>(context);
         if (!SetThreadDesktop(self.desktop)) {
@@ -116,6 +148,16 @@ struct Engine::Impl {
         MSG msg{};
         PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
         self.hookThread = GetCurrentThreadId();
+        WNDCLASSW rawClass{}; rawClass.hInstance = GetModuleHandleW(nullptr);
+        rawClass.lpszClassName = kRawClass; rawClass.lpfnWndProc = RawRelease;
+        RegisterClassW(&rawClass);
+        HWND rawWindow = CreateWindowExW(0, kRawClass, L"", 0, 0, 0, 0, 0,
+            HWND_MESSAGE, nullptr, rawClass.hInstance, nullptr);
+        self.rawError = rawWindow ? ERROR_SUCCESS : GetLastError();
+        if (rawWindow) {
+            RAWINPUTDEVICE device{1, 6, RIDEV_INPUTSINK, rawWindow};
+            if (!RegisterRawInputDevices(&device, 1, sizeof(device))) self.rawError = GetLastError();
+        }
         HHOOK keyboard = nullptr, mouse = nullptr;
         ULONGLONG lastInstall = 0, retryAt = 0;
         DWORD delay = 1000;
@@ -149,13 +191,14 @@ struct Engine::Impl {
                 if (msg.message == WM_TIMER && msg.wParam == timer) {
                     const auto now = GetTickCount64(); self.hookBeat = now;
                     if ((self.rehookRequested || now - lastInstall >= 10000 || !keyboard) &&
-                        now >= retryAt && !AnyDeliveredKeyHeld()) install();
+                        now >= retryAt && self.keys.CanRefresh(AnyDeliveredKeyHeld())) install();
                 } else { TranslateMessage(&msg); DispatchMessageW(&msg); }
             }
         }
         if (timer) KillTimer(nullptr, timer);
         if (keyboard) UnhookWindowsHookEx(keyboard);
         if (mouse) UnhookWindowsHookEx(mouse);
+        if (rawWindow) { RemoveRawSink(rawWindow); DestroyWindow(rawWindow); }
         self.installed = false; self.hookThread = 0; hookOwner = nullptr;
         return 0;
     }

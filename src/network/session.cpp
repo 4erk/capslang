@@ -23,7 +23,11 @@ public:
             if (part.empty() || buffer_.size() + part.size() > 1279) { error_ = ERROR_INVALID_DATA; return false; }
             buffer_.insert(buffer_.end(), part.begin(), part.end());
         }
-        if (!DecodeControl(buffer_.data(), ControlWire{}.size(), value)) { error_ = ERROR_INVALID_DATA; return false; }
+        if (!DecodeControl(buffer_.data(), ControlWire{}.size(), value)) {
+            error_ = buffer_.size() >= 5 && buffer_[0]=='C' && buffer_[1]=='L' && buffer_[2]=='B' &&
+                buffer_[3]=='P' && buffer_[4]!=2 ? ERROR_REVISION_MISMATCH : ERROR_INVALID_DATA;
+            return false;
+        }
         buffer_.erase(buffer_.begin(), buffer_.begin() + ControlWire{}.size()); return true;
     }
     DWORD Error() const { return error_; }

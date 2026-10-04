@@ -5,13 +5,14 @@
 #include <memory>
 
 namespace capslang::ipc {
-constexpr std::uint32_t kMagic = 0x314c5043, kVersion = 3;
+constexpr std::uint32_t kMagic = 0x314c5043, kVersion = 4;
 enum class Operation : std::uint32_t {
-    Status = 1, SetLayout = 2, RefreshHook = 3, Stop = 4, SetLayoutIfRevision = 5
+    Status = 1, SetLayout = 2, RefreshHook = 3, Stop = 4, SetLayoutIfRevision = 5,
+    ReportProfile = 6, ManualProfile = 7
 };
 enum StatusFlag : std::uint32_t {
     Elevated = 1U, HookRegistered = 2U, HookResponsive = 4U, Locked = 8U,
-    LedWritten = 16U, LedPartial = 32U
+    ProfileConfirmed = 16U, SystemEnabled = 32U
 };
 enum MwbFlag : std::uint32_t { MwbRunning = 1U, RecipientAvailable = 2U };
 #pragma pack(push, 1)
@@ -21,26 +22,33 @@ struct Request {
     std::uint32_t language = 0;
     std::uint64_t id = 0, reserved = 0;
     // Conditional update binds both the engine incarnation and local intent.
-    // All other operations require zero in both fields.
+    // Profile operations bind expectedRevision to the request generation.
+    // All remaining operations require zero in both fields.
     std::uint64_t engineEpoch = 0, expectedRevision = 0;
 };
 struct Response {
     std::uint32_t magic = kMagic, version = kVersion;
     std::uint64_t id = 0;
     std::uint32_t error = 0, target = 0, actual = 0, apply = 0, flags = 0;
-    std::uint32_t hookError = 0, layoutError = 0, ledError = 0;
+    std::uint32_t hookError = 0, layoutError = 0;
+    std::uint32_t profileError = 0;
     std::uint64_t generation = 0, revision = 0, recovery = 0;
-    std::uint64_t physicalAge = UINT64_MAX, injectedKeyAge = UINT64_MAX;
+    // Same offsets as v3; the installer fallback never interprets these fields.
+    std::uint64_t profileLanguage = 0, profileGeneration = 0;
     std::uint64_t engineEpoch = 0;
     std::uint64_t activitySerial = 0, activityAge = UINT64_MAX;
     std::uint32_t mwbFlags = 0, mwbError = 0;
 };
 #pragma pack(pop)
-static_assert(sizeof(Request) == 48 && sizeof(Response) == 120, "fixed wire ABI v3");
+static_assert(sizeof(Request) == 48 && sizeof(Response) == 120, "fixed wire ABI v4, v3 sizes retained for installer");
 bool Valid(const Request& request);
 struct Endpoint {
     std::wstring name, sid;
     DWORD session = 0, error = 0;
+    // Optional stricter trust policy selected by local code, never wire data.
+    // sid always identifies the allowed client; serverSid may be SYSTEM.
+    std::wstring serverSid, clientImage;
+    bool requireClientElevation = false;
     static Endpoint Current(const std::wstring& instance = L"1.1");
 };
 // Fixed-size local messages share authentication, limits and cancellation.
@@ -79,4 +87,6 @@ private:
 // No trust decision is supplied by data received from the server itself.
 bool Call(const Endpoint& endpoint, const std::wstring& expectedServerPath,
           bool requireElevation, const Request& request, Response& response, DWORD& error);
+// Only installer lifecycle uses v3 fallback; never layout/synchronization.
+bool InstallationCall(const Endpoint&, const std::wstring&, const Request&, Response&, DWORD&);
 } // namespace capslang::ipc

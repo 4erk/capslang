@@ -39,7 +39,7 @@ bool EngineClient::RecipientState(const ipc::Response& response, std::uint64_t r
         // latency widens the age interval; wall clocks are never compared.
         age = {response.activityAge, response.activityAge+roundTrip, true};
     }
-    const bool enabled = response.mwbFlags == (ipc::MwbRunning | ipc::RecipientAvailable);
+    const bool enabled = (response.mwbFlags & ipc::MwbRunning) != 0;
     return MakeState(response,response.activitySerial,age,enabled,output);
 }
 bool EngineClient::MakeState(const ipc::Response& response, std::uint64_t activitySerial,
@@ -55,6 +55,10 @@ bool EngineClient::MakeState(const ipc::Response& response, std::uint64_t activi
         static_cast<core::Language>(response.target), activity, mwb};
     value.actual = static_cast<core::Language>(response.actual);
     value.apply = static_cast<core::ApplyState>(response.apply);
+    if ((response.flags & ipc::SystemEnabled) && value.apply == core::ApplyState::Applied &&
+        (!(response.flags & ipc::ProfileConfirmed) || response.profileError ||
+         response.profileLanguage != response.target || response.profileGeneration != response.generation))
+        value.apply = core::ApplyState::Pending;
     value.locked = (response.flags & ipc::Locked) != 0;
     if (!sync::Valid(value.snapshot)) return false;
     output = value; return true;

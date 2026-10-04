@@ -5,6 +5,7 @@
 #include "../src/app/paths.hpp"
 #include "../src/app/tasks.hpp"
 #include "../src/platform/private_store.hpp"
+#include "../src/runtime/system_layout.hpp"
 #include <atomic>
 #include <bcrypt.h>
 #include <cstdio>
@@ -167,6 +168,21 @@ void InstallationRecords() {
     Check(install::Encode(record, bytes) && install::Decode(bytes, decoded) &&
               decoded.before == record.before,
           "previous executable and owned task metadata preserved");
+    record.hadLayoutService = true;
+    Check(install::Encode(record, bytes) && install::Decode(bytes, decoded) && decoded.hadLayoutService,
+          "rollback remembers prior SYSTEM service ownership");
+    // Construct a checksummed version-1 RC1 journal, not a corrupt v2 record.
+    record.hadLayoutService = false;
+    Check(install::Encode(record, bytes), "migration fixture encoded");
+    bytes[4] = 1;
+    BCRYPT_ALG_HANDLE sha = nullptr; install::Hash digest{};
+    const bool hashing = BCryptOpenAlgorithmProvider(&sha, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0;
+    const bool oldDigest = hashing && BCryptHash(sha, nullptr, 0, bytes.data(), static_cast<ULONG>(bytes.size()-32),
+        digest.data(), static_cast<ULONG>(digest.size())) == 0;
+    if (sha) BCryptCloseAlgorithmProvider(sha, 0);
+    if (oldDigest) memcpy(bytes.data()+bytes.size()-32, digest.data(), 32);
+    Check(oldDigest && install::Decode(bytes, decoded) && !decoded.hadLayoutService,
+          "RC1 journal upgrades without inventing a prior SYSTEM service");
     if (!ProcessElevation(GetCurrentProcessId()).elevated)
         Check(AdminInstall(AdminAction::Install) == ERROR_ACCESS_DENIED,
               "ordinary code cannot enter administrative installation");
@@ -191,6 +207,23 @@ void InstallationRecords() {
         }
         CoUninitialize();
     }
+}
+void SystemBoundary() {
+    const auto current = ipc::Endpoint::Current();
+    const auto endpoint = system_layout::Endpoint(current.sid, current.session);
+    Check(!endpoint.error && endpoint.sid == current.sid && endpoint.serverSid == L"S-1-5-18" &&
+        endpoint.session == current.session, "SYSTEM endpoint separates server from allowed user identity");
+    Check(system_layout::Endpoint(L"S-1-5-18",1).error != 0, "SYSTEM cannot be selected as installation user");
+    Check(system_layout::Endpoint(current.sid,0).error != 0, "session zero not an interactive target");
+    Check(system_layout::Endpoint(L"invalid",1).error != 0, "malformed client SID refused");
+    if (!system_layout::IsSystem()) {
+        Check(system_layout::WorkerMain() == ERROR_ACCESS_DENIED, "ordinary/elevated user cannot run SYSTEM worker");
+        Check(system_layout::ServiceMain() == ERROR_ACCESS_DENIED, "ordinary/elevated user cannot run SYSTEM service");
+    }
+    system_layout::Request request; request.id = 1;
+    system_layout::Response response; DWORD error = 0;
+    Check(!system_layout::Call(ExecutablePath(),request,response,error) && error == ERROR_ACCESS_DENIED,
+          "unprotected developer image cannot invoke privileged layout channel");
 }
 void TaskDefinitions() {
     const auto endpoint = ipc::Endpoint::Current();
@@ -318,7 +351,8 @@ void Lifecycle() {
                                  return true;
                              },
                              [](const sync::ApplyCommand &) { return false; },
-                             {}}};
+                             {}},
+                            {}};
     const auto endpoint =
         ipc::Endpoint::Current(L"app-test-" + std::to_wstring(GetCurrentProcessId()));
     Broker broker(scratch.path, deps, endpoint);
@@ -399,6 +433,7 @@ void Lifecycle() {
 int main() {
     Codec();
     InstallationRecords();
+    SystemBoundary();
     TaskDefinitions();
     Lifecycle();
     std::printf("Application: %u checks, %u failures; model engine, isolated files, no "

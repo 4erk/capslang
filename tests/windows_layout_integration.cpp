@@ -608,14 +608,14 @@ void EngineTests(const std::wstring& desktop) {
         Check(selector.Select(second.Target(),snapshot).focus==second.data->window,"stale MWB evidence cannot redirect a target");
         Check(first.Reset(0),"background focus regression fixture reset");
     }
-    Engine engine({false, CaptureFixture}); // No hardware writes in this suite.
+    Engine engine({CaptureFixture});
     Check(!engine.SetTarget(Language::Russian) && !engine.RestartHook(), "stopped engine rejects work");
     Check(engine.Start(), "real engine worker starts on private desktop");
     Check(PumpUntil([&] { return engine.Status().hookRegistered && engine.Status().hookThreadResponsive; }),
           "real low-level hooks installed and dedicated thread responsive");
     const HWND rawSink = EngineRawSink();
     Check(rawSink && !engine.Status().hookError, "dedicated hook thread registered Raw Input release observer");
-    Check(rawSink && EngineRawSink(2) == rawSink, "mouse recipient and Caps release share one owned Raw Input sink");
+    Check(rawSink && !EngineRawSink(2), "engine does not register a mouse Raw Input observer");
     const auto rawRevision = engine.Status().userRevision;
     if (rawSink) {
         DWORD_PTR ignored = 0;
@@ -697,10 +697,10 @@ void EngineTests(const std::wstring& desktop) {
     Check(!EngineRawSink() && !EngineRawSink(2) && !IsWindow(rawSink), "engine shutdown removes both owned Raw Input registrations and window");
     Check(!engine.SetTarget(Language::English) && !engine.RestartHook(), "post-stop work rejected");
     const auto hostEndpoint = ipc::Endpoint::Current(L"host-test-" + std::to_wstring(GetCurrentProcessId()));
-    EngineHost host(hostEndpoint, {false, CaptureFixture});
+    EngineHost host(hostEndpoint, {CaptureFixture});
     Check(host.Start() && host.Start(), "production IPC engine host starts idempotently");
     {
-        EngineHost duplicate(hostEndpoint, {false, CaptureFixture});
+        EngineHost duplicate(hostEndpoint, {CaptureFixture});
         Check(!duplicate.Start() && duplicate.Error() == ERROR_ACCESS_DENIED,
               "duplicate host is rejected before it can start a second engine");
     }
@@ -727,8 +727,8 @@ void EngineTests(const std::wstring& desktop) {
         return call() && response.target == kRussian && response.actual == kRussian &&
             response.apply == static_cast<DWORD>(ApplyState::Applied) && TargetLanguage(second.Target()) == kRussian;
     }), "IPC-to-production-engine-to-foreign-window RU is actually confirmed");
-    Check(response.revision == 0 && response.physicalAge == UINT64_MAX,
-          "IPC requests do not masquerade as physical input or local user changes");
+    Check(response.revision == 0 && response.activitySerial == 0 && response.activityAge == UINT64_MAX,
+          "IPC application cannot masquerade as an explicit local language choice");
     const auto epoch = response.engineEpoch;
     Check(epoch != 0, "host publishes a random nonzero incarnation");
     request.operation = ipc::Operation::SetLayoutIfRevision; request.language = kEnglish;
@@ -757,8 +757,8 @@ void EngineTests(const std::wstring& desktop) {
         sync::LocalState invalid;
         Check(!EngineClient::MakeState(malformed, 0, {}, true, invalid), "broker rejects unknown status flags");
         Check(!EngineClient::MakeState(sample, 0, {0, 0, true}, true, invalid), "known activity requires actual activity serial");
-        Check(client.ReadState(invalid) && !invalid.snapshot.activity.known && !invalid.snapshot.mwb,
-              "private desktop has no invented recipient or usable MWB route");
+        Check(client.ReadState(invalid) && !invalid.snapshot.activity.known,
+              "no explicit language change means no invented choice age");
         auto recipientSample = sample;
         recipientSample.activitySerial = 1; recipientSample.activityAge = 10;
         recipientSample.mwbFlags = ipc::MwbRunning | ipc::RecipientAvailable;
@@ -766,8 +766,8 @@ void EngineTests(const std::wstring& desktop) {
               invalid.snapshot.activity.minimum == 10 && invalid.snapshot.activity.maximum == 30,
               "recipient age interval includes bounded IPC round trip");
         recipientSample.mwbFlags = ipc::MwbRunning;
-        Check(EngineClient::RecipientState(recipientSample,20,invalid) && !invalid.snapshot.mwb,
-              "unsafe recipient metadata disables reconciliation despite running MWB");
+        Check(EngineClient::RecipientState(recipientSample,20,invalid) && invalid.snapshot.mwb,
+              "MWB presence enables synchronization without recipient metadata");
         recipientSample.mwbFlags = ipc::RecipientAvailable;
         Check(!EngineClient::RecipientState(recipientSample,20,invalid), "available recipient without MWB rejected");
         recipientSample.mwbFlags = 0; recipientSample.activitySerial = 0;
@@ -900,34 +900,40 @@ void EngineTests(const std::wstring& desktop) {
           "old broker request rejected after restart even when revision numbers match");
     host.Stop();
     {
-        HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr), release = CreateEventW(nullptr, TRUE, FALSE, nullptr), returned = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        Check(entered && release && returned, "engine stalled-LED fixture events created");
-        EngineOptions isolatedLed{true, CaptureFixture};
-        isolatedLed.ledOperation = [&](Language, bool) {
-            SetEvent(entered); WaitForSingleObject(release, INFINITE); SetEvent(returned);
-            return LedStatus{1, 0, 0, true};
-        };
-        Engine withBlockedLed(isolatedLed);
-        Check(withBlockedLed.Start() && PumpUntil([&] { return WaitForSingleObject(entered, 0) == WAIT_OBJECT_0; }),
-              "production engine reaches controlled stalled LED operation without writing hardware");
-        Check(withBlockedLed.SetTarget(Language::English) && PumpUntil([&] {
-            return withBlockedLed.Status().actual == Language::English && TargetLanguage(second.Target()) == kEnglish;
-        }), "stalled LED driver cannot block real EN application");
-        Check(withBlockedLed.SetTarget(Language::Russian) && PumpUntil([&] {
-            return withBlockedLed.Status().actual == Language::Russian && TargetLanguage(second.Target()) == kRussian;
-        }), "stalled LED driver cannot block subsequent RU application");
-        Check(PumpUntil([&] { return withBlockedLed.Status().ledError == ERROR_TIMEOUT; }, 2500),
-              "engine reports stalled LED instead of hiding device failure");
-        const auto began = GetTickCount64(); withBlockedLed.Stop();
-        Check(GetTickCount64() - began < 1500 && !withBlockedLed.Status().hookRegistered,
-              "engine shutdown removes hooks without waiting indefinitely on LED driver");
-        SetEvent(release);
-        Check(WaitForSingleObject(returned, 1000) == WAIT_OBJECT_0, "isolated LED context survives bounded engine shutdown safely");
-        // Wait for callback destruction before closing its fixture handles.
-        LedWorker slot;
-        Check(PumpUntil([&] { return slot.Start([](Language, bool) { return LedStatus{}; }); }), "LED ownership slot released after real completion");
-        slot.Stop();
-        CloseHandle(entered); CloseHandle(release); CloseHandle(returned);
+        EngineOptions options{CaptureFixture};
+        options.requireDesktopProfile = true;
+        Engine verified(options);
+        Check(verified.Start(), "profile-confirmed engine starts on isolated desktop");
+        Check(verified.SetTarget(Language::English) && PumpUntil([&] {
+            return verified.Status().actual == Language::English;
+        }), "window applies independently of desktop profile confirmation");
+        auto state = verified.Status();
+        Check(state.apply != ApplyState::Applied && !state.profileConfirmed,
+              "actual window alone cannot acknowledge desktop-wide success");
+        Check(verified.ProfileReport(kEnglish, state.generation - 1, 0, false),
+              "stale profile report can enter queue for worker validation");
+        PumpUntil([] { return false; }, 80);
+        Check(!verified.Status().profileConfirmed, "worker rejects stale profile generation");
+        Check(verified.ProfileReport(kEnglish, state.generation, 0, false) && PumpUntil([&] {
+            return verified.Status().profileConfirmed && verified.Status().apply == ApplyState::Applied;
+        }), "both current profile and window confirmations are required");
+        Check(PumpUntil([&] {
+            return !verified.Status().profileConfirmed && verified.Status().apply != ApplyState::Applied;
+        }, 1600), "lost broker reports expire rather than retaining Applied forever");
+        Check(verified.ProfileReport(0, state.generation, ERROR_ACCESS_DENIED, false) && PumpUntil([&] {
+            return verified.Status().profileError == ERROR_ACCESS_DENIED;
+        }), "profile failure survives into status");
+        Check(verified.ProfileReport(kEnglish, state.generation, 0, false) && PumpUntil([&] {
+            return verified.Status().apply == ApplyState::Applied;
+        }), "temporary profile failure recovers without a new user toggle");
+        Check(verified.SetTarget(Language::Russian) && PumpUntil([&] {
+            return verified.Status().target == Language::Russian;
+        }), "new choice supersedes profile request");
+        verified.ProfileReport(kEnglish, state.generation, 0, false);
+        PumpUntil([] { return false; }, 80);
+        Check(!verified.Status().profileConfirmed && verified.Status().apply != ApplyState::Applied,
+              "late old profile success cannot acknowledge a newer choice");
+        verified.Stop();
     }
     capturedWindow = nullptr;
 }

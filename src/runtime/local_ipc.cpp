@@ -24,10 +24,23 @@ bool ClientMatches(HANDLE pipe, const Endpoint& endpoint) {
     if (!ImpersonateNamedPipeClient(pipe)) return false;
     HANDLE token = nullptr;
     const bool opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token) != FALSE;
-    const bool match = opened && TokenMatches(token, endpoint);
+    DWORD bytes = 0;
+    TOKEN_ELEVATION elevation{};
+    bool match = opened && TokenMatches(token, endpoint) &&
+        (!endpoint.requireClientElevation ||
+         (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &bytes) && elevation.TokenIsElevated));
     if (token) CloseHandle(token);
     // Never call the handler while impersonating even the allowed user.
     if (!RevertToSelf()) std::terminate();
+    if (match && !endpoint.clientImage.empty()) {
+        ULONG pid = 0;
+        match = GetNamedPipeClientProcessId(pipe, &pid) != FALSE;
+        HANDLE process = match ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
+        wchar_t path[32768]{}; DWORD length = ARRAYSIZE(path);
+        match = process && QueryFullProcessImageNameW(process, 0, path, &length) &&
+            _wcsicmp(path, endpoint.clientImage.c_str()) == 0;
+        if (process) CloseHandle(process);
+    }
     return match;
 }
 bool ServerMatches(HANDLE pipe, const Endpoint& endpoint, const std::wstring& path, bool high) {
@@ -39,9 +52,11 @@ bool ServerMatches(HANDLE pipe, const Endpoint& endpoint, const std::wstring& pa
     wchar_t actual[32768]{};
     DWORD length = ARRAYSIZE(actual), bytes = 0;
     TOKEN_ELEVATION elevation{};
+    auto server = endpoint;
+    if (!endpoint.serverSid.empty()) server.sid = endpoint.serverSid;
     const bool valid = QueryFullProcessImageNameW(process, 0, actual, &length) &&
         _wcsicmp(actual, path.c_str()) == 0 &&
-        OpenProcessToken(process, TOKEN_QUERY, &token) && TokenMatches(token, endpoint) &&
+        OpenProcessToken(process, TOKEN_QUERY, &token) && TokenMatches(token, server) &&
         GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &bytes) &&
         (!high || elevation.TokenIsElevated);
     if (token) CloseHandle(token);
@@ -80,7 +95,15 @@ bool Transfer(HANDLE pipe, void* buffer, DWORD size, bool write, HANDLE stop, DW
 }
 }
 bool Valid(const Request& request) {
-    if (request.magic != kMagic || request.version != kVersion || !request.id || request.reserved) return false;
+    if (request.magic != kMagic || request.version != kVersion || !request.id) return false;
+    if (request.operation == Operation::ReportProfile) {
+        return request.engineEpoch && request.reserved <= UINT32_MAX &&
+            ((request.language == 0 && request.reserved != 0) ||
+             ((request.language == 0x409 || request.language == 0x419) && !request.reserved));
+    }
+    if (request.operation == Operation::ManualProfile)
+        return request.engineEpoch && !request.reserved && (request.language == 0x409 || request.language == 0x419);
+    if (request.reserved) return false;
     if (request.operation == Operation::SetLayoutIfRevision) {
         if (!request.engineEpoch) return false;
     } else if (request.engineEpoch || request.expectedRevision) return false;
@@ -233,7 +256,21 @@ bool Call(const Endpoint& endpoint, const std::wstring& path, bool high, const R
     if (!Valid(request)) { error = ERROR_INVALID_PARAMETER; return false; }
     Response incoming{};
     if (!Exchange(endpoint,path,high,&request,sizeof(request),&incoming,sizeof(incoming),error)) return false;
-    if (incoming.magic != kMagic || incoming.version != kVersion || incoming.id != request.id) { error = ERROR_INVALID_DATA; return false; }
+    if (incoming.magic != kMagic || incoming.id != request.id) { error = ERROR_INVALID_DATA; return false; }
+    if (incoming.version != kVersion) { error = ERROR_REVISION_MISMATCH; return false; }
     response = incoming; error = 0; return true;
+}
+bool InstallationCall(const Endpoint& endpoint, const std::wstring& path, const Request& request,
+                      Response& response, DWORD& error) {
+    if ((request.operation != Operation::Status && request.operation != Operation::Stop) || !Valid(request)) {
+        error = ERROR_INVALID_PARAMETER; return false;
+    }
+    if (Call(endpoint,path,true,request,response,error)) return true;
+    if (error != ERROR_REVISION_MISMATCH) return false;
+    auto legacy = request; legacy.version = 3;
+    Response incoming;
+    if (!Exchange(endpoint,path,true,&legacy,sizeof(legacy),&incoming,sizeof(incoming),error)) return false;
+    if (incoming.magic != kMagic || incoming.version != 3 || incoming.id != request.id) { error = ERROR_REVISION_MISMATCH; return false; }
+    response = incoming; error = incoming.error; return !error;
 }
 } // namespace capslang::ipc

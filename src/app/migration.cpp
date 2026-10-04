@@ -240,7 +240,7 @@ bool NoManagedEngine(DWORD &error) {
     ipc::Request query;
     query.id = 1;
     ipc::Response response;
-    if (ipc::Call(ipc::Endpoint::Current(), installed, true, query, response, error)) {
+    if (ipc::InstallationCall(ipc::Endpoint::Current(), installed, query, response, error)) {
         error = ERROR_BUSY;
         return false;
     }

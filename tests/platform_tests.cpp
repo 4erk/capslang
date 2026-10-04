@@ -24,15 +24,6 @@ int main() {
     const auto elevation = ProcessElevation(GetCurrentProcessId());
     check(elevation.known, "own elevation can be inspected");
     check(!ProcessElevation(0xffffffff).known, "unknown elevation not assumed low");
-    KeyboardLeds leds;
-    USHORT flags = 0x1234;
-    DWORD error = 0;
-    check(!leds.ReadFlags(0, flags, error) && error == ERROR_INVALID_HANDLE,
-          "invalid LED read is rejected");
-    check(flags == 0x1234, "failed read preserves caller output");
-    check(!leds.SetScroll(0, true, error) && error == ERROR_INVALID_HANDLE,
-          "invalid LED write is rejected");
-    check(leds.Devices().empty(), "construction does not open devices");
     std::printf("Platform tests: %u checks, %u failures. No input or LED changes performed.\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -24,17 +24,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
            << ",\"elevation_known\":" << elevation.known << ",\"elevated\":" << elevation.elevated
            << ",\"elevation_error\":" << elevation.error << ",\"en_installed\":" << !!FindLayout(kEnglish)
            << ",\"ru_installed\":" << !!FindLayout(kRussian) << "}\r\n";
-    KeyboardLeds leds;
-    leds.Discover();
-    for (size_t i = 0; i < leds.Devices().size(); ++i) {
-        const auto& device = leds.Devices()[i];
-        report << "{\"event\":\"led_device\",\"index\":" << i
-               << ",\"class_device\":" << (device.path.find(L"GLOBALROOT") != std::wstring::npos)
-               << ",\"open_error\":" << device.openError << ",\"query_error\":" << device.queryError
-               << ",\"queried\":" << device.queried << ",\"flags\":" << device.flags << "}\r\n";
-    }
-    report << "{\"event\":\"led_enumeration\",\"count\":" << leds.Devices().size()
-           << ",\"error\":" << leds.EnumerationError() << "}\r\n";
     const std::string text = report.str();
     DWORD written = 0;
     const bool ok = WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), text.data(),

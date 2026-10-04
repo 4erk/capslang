@@ -40,7 +40,7 @@ inline bool HasSnapshot(ControlKind kind) {
 inline bool EncodeControl(const Control& value, ControlWire& wire) {
     wire.fill(0);
     if (!Nonzero(value.session) || !value.round || value.kind < ControlKind::Hello || value.kind > ControlKind::PollReply) return false;
-    wire[0] = 'C'; wire[1] = 'L'; wire[2] = 'B'; wire[3] = 'P'; wire[4] = 1; wire[5] = static_cast<std::uint8_t>(value.kind);
+    wire[0] = 'C'; wire[1] = 'L'; wire[2] = 'B'; wire[3] = 'P'; wire[4] = 2; wire[5] = static_cast<std::uint8_t>(value.kind);
     std::copy(value.session.begin(), value.session.end(), wire.begin() + 8); wire_detail::Put64(wire.data() + 24, value.round);
     if (wire_detail::HasSnapshot(value.kind)) {
         if (!Valid(value.first)) return false;
@@ -67,7 +67,7 @@ inline bool EncodeControl(const Control& value, ControlWire& wire) {
     return true;
 }
 inline bool DecodeControl(const std::uint8_t* bytes, size_t size, Control& output) {
-    if (!bytes || size != ControlWire{}.size() || bytes[0] != 'C' || bytes[1] != 'L' || bytes[2] != 'B' || bytes[3] != 'P' || bytes[4] != 1) return false;
+    if (!bytes || size != ControlWire{}.size() || bytes[0] != 'C' || bytes[1] != 'L' || bytes[2] != 'B' || bytes[3] != 'P' || bytes[4] != 2) return false;
     Control value; value.kind = static_cast<ControlKind>(bytes[5]);
     std::copy_n(bytes + 8, 16, value.session.begin()); value.round = wire_detail::Get64(bytes + 24);
     if (wire_detail::HasSnapshot(value.kind)) value.first = wire_detail::GetSnapshot(bytes + 32);

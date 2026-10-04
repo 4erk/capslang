@@ -1,4 +1,5 @@
 #include "../runtime/engine_host.hpp"
+#include "../runtime/system_layout.hpp"
 #include "installer.hpp"
 #include "paths.hpp"
 #include "tasks.hpp"
@@ -39,6 +40,14 @@ int Main(const std::vector<std::wstring> &args) {
     const bool json = args.size() == 2 && args[1] == L"--json" && mode == std::wstring(L"--status");
     if (args.size() > 1 && !json)
         return ERROR_INVALID_PARAMETER;
+    if (mode == std::wstring(L"--layout-service")) return static_cast<int>(system_layout::ServiceMain());
+    if (mode == std::wstring(L"--layout-worker")) return static_cast<int>(system_layout::WorkerMain());
+    if (mode == std::wstring(L"--layout-check")) {
+        system_layout::Request request; request.id = GetTickCount64() + 1;
+        system_layout::Response response; DWORD failure = 0;
+        system_layout::Call(executable, request, response, failure);
+        return static_cast<int>(failure);
+    }
     DWORD error = 0;
     if (mode == std::wstring(L"--admin-install") || mode == std::wstring(L"--admin-revert") ||
         mode == std::wstring(L"--admin-uninstall"))
@@ -76,7 +85,18 @@ int Main(const std::vector<std::wstring> &args) {
             return Failure(error ? error : ERROR_ACCESS_DENIED, false);
         if (FindWindowW(L"CapsLang.Reliable.HiddenWindow.1", nullptr))
             return ERROR_BUSY;
-        EngineHost host;
+        EngineOptions options;
+        options.requireDesktopProfile = true;
+        options.systemApply = [executable](LANGID language) {
+            system_layout::Request request;
+            request.id = GetTickCount64() + 1;
+            request.operation = system_layout::Operation::Apply;
+            request.language = language;
+            system_layout::Response response; DWORD failure = 0;
+            system_layout::Call(executable, request, response, failure);
+            return failure;
+        };
+        EngineHost host(ipc::Endpoint::Current(), options);
         if (!host.Start())
             return Failure(host.Error(), false);
         WaitForSingleObject(host.ShutdownEvent(), INFINITE);

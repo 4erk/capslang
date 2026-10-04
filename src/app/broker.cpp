@@ -1,5 +1,6 @@
 #include "broker.hpp"
 #include "../runtime/engine_client.hpp"
+#include "desktop_profile.hpp"
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -83,9 +84,13 @@ struct Broker::Impl {
         if (old.engineError == next.engineError && old.engine.flags == next.engine.flags &&
             old.engine.hookError == next.engine.hookError &&
             old.engine.layoutError == next.engine.layoutError &&
-            old.engine.ledError == next.engine.ledError && old.networkPhase == next.networkPhase &&
+            old.engine.profileError == next.engine.profileError && old.networkPhase == next.networkPhase &&
             old.networkError == next.networkError && old.commandError == next.commandError &&
-            old.engine.recovery == next.engine.recovery)
+            old.engine.recovery == next.engine.recovery &&
+            old.engine.target == next.engine.target && old.engine.actual == next.engine.actual &&
+            old.engine.generation == next.engine.generation && old.engine.revision == next.engine.revision &&
+            old.engine.apply == next.engine.apply && old.peerApplied == next.peerApplied &&
+            old.sharedTarget == next.sharedTarget)
             return;
         const auto path = directory + L"\\capslang.log";
         WIN32_FILE_ATTRIBUTE_DATA attr{};
@@ -126,8 +131,14 @@ struct Broker::Impl {
         }
     }
     void Run() {
+        std::unique_ptr<DesktopProfile> profile;
+        if (dependencies.profile) profile = std::make_unique<DesktopProfile>();
         network.Start(); // A failed network must not take down local CapsLock.
         while (WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
+            if (profile) {
+                MSG message{};
+                while (PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
+            }
             std::optional<ControlRequest> command;
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -150,6 +161,10 @@ struct Broker::Impl {
                 next.engine = {};
                 next.engineError = readError ? readError : ERROR_NOT_READY;
             }
+            if (profile && !next.engineError) profile->Update(next.engine,
+                [&](LANGID language,std::uint64_t generation,DWORD failure,bool manual) {
+                    return dependencies.profile(next.engine,language,generation,failure,manual);
+                });
             auto net = network.Status();
             next.sampled = GetTickCount64();
             next.networkPhase = static_cast<std::uint32_t>(net.phase);
@@ -171,7 +186,7 @@ struct Broker::Impl {
             }
             Log(old, next);
             HANDLE waits[]{stop, wake};
-            WaitForMultipleObjects(2, waits, FALSE, 250);
+            MsgWaitForMultipleObjects(2, waits, FALSE, 50, QS_ALLINPUT);
         }
         network.Stop();
         if (stopEngine) {
@@ -328,6 +343,14 @@ BrokerDependencies EngineDependencies(const std::wstring &executable, bool high)
             },
             {[peer](sync::LocalState &value) { return peer->ReadState(value); },
              [peer](const sync::ApplyCommand &value) { return peer->Queue(value); },
-             {}}};
+             {}},
+            [executable,high,sequence](const ipc::Response& state,LANGID language,std::uint64_t generation,DWORD failure,bool manual) {
+                ipc::Request request;
+                request.id = ++*sequence; request.operation = manual ? ipc::Operation::ManualProfile : ipc::Operation::ReportProfile;
+                request.language = language; request.engineEpoch = state.engineEpoch;
+                request.expectedRevision = generation; request.reserved = failure;
+                ipc::Response response; DWORD error = 0;
+                return ipc::Call(ipc::Endpoint::Current(),executable,high,request,response,error) && !response.error;
+            }};
 }
 } // namespace capslang::app

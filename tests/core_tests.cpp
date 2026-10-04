@@ -77,7 +77,7 @@ int main() {
     layout.Observe(Language::English, layout.Generation(), 1099);
     check(layout.State() == ApplyState::Pending, "asynchronous acknowledgement allowed");
     layout.Observe(Language::English, layout.Generation(), 1100);
-    check(layout.State() == ApplyState::Failed && !layout.Due(1101), "unapplied target is failure, no infinite retry");
+    check(layout.State() == ApplyState::Failed && !layout.Due(1101), "failed target backs off instead of spinning");
     check(layout.UserRevision() == revision, "peer changes do not echo as local input");
     layout.Lock(true, 1200);
     layout.Request(Language::English, Origin::Peer, 1201);
@@ -100,6 +100,30 @@ int main() {
     const auto manualRevision = layout.UserRevision();
     layout.FocusChanged(2505);
     check(layout.RequestPeer(Language::English, manualRevision, 2506), "focus-only changes do not invalidate user intent revision");
+    LayoutState retry;
+    retry.Initialize(Language::English);
+    retry.Request(Language::Russian, Origin::Peer, 10);
+    const auto retryGeneration = retry.Generation();
+    retry.Sent(retryGeneration, 10);
+    retry.Observe(Language::English, retryGeneration, 1010);
+    check(!retry.Due(2009) && retry.Due(2010) && retry.Target() == Language::Russian,
+          "failed absolute target survives and retries at bounded frequency");
+    retry.Sent(retryGeneration, 2010);
+    retry.Observe(Language::Russian, retryGeneration, 2020);
+    check(retry.State() == ApplyState::Applied && retry.UserRevision() == 0,
+          "retry confirms without manufacturing user intent");
+    retry.Observe(Language::Unknown, retryGeneration, 2030);
+    check(retry.State() == ApplyState::Pending && retry.Due(2030) &&
+          retry.Generation() == retryGeneration && retry.UserRevision() == 0,
+          "lost confirmation revokes success while preserving request identity");
+    retry.Observe(Language::Russian, retryGeneration, 2040);
+    retry.Observe(Language::English, retryGeneration, 2050);
+    check(retry.State() == ApplyState::Pending && retry.Target() == Language::Russian,
+          "changed actual language cannot retain stale Applied");
+    retry.Toggle(2060);
+    retry.Observe(Language::Russian, retryGeneration, 2070);
+    check(retry.Target() == Language::English && retry.State() == ApplyState::Pending,
+          "old retry acknowledgement cannot overwrite newer user choice");
     std::printf("Core tests: %u checks, %u failures.\n", checks, failed);
     return failed ? 1 : 0;
 }

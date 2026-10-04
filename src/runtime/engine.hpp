@@ -1,8 +1,8 @@
 #pragma once
 #include "../platform/windows_support.hpp"
 #include "../core/layout.hpp"
-#include "led_worker.hpp"
 #include <memory>
+#include <functional>
 
 namespace capslang {
 struct EngineStatus {
@@ -13,16 +13,21 @@ struct EngineStatus {
     std::uint64_t activitySerial = 0, lastRecipientInput = 0;
     DWORD mwbError = ERROR_NOT_READY;
     bool mwbRunning = false, recipientAvailable = false;
-    DWORD hookError = 0, powerError = 0, sessionError = 0, layoutError = 0, ledError = 0;
-    unsigned ledWritten = 0, ledUnsupported = 0;
+    DWORD hookError = 0, powerError = 0, sessionError = 0, layoutError = 0;
     bool elevated = false, hookRegistered = false, hookThreadResponsive = false, locked = false;
+    LANGID profileLanguage = 0;
+    DWORD profileError = ERROR_NOT_READY;
+    std::uint64_t profileGeneration = 0;
+    bool profileConfirmed = false, systemEnabled = false;
 };
 struct EngineOptions {
-    bool hardwareLeds = true;
     // Test dependency supplied by code, not by CLI or IPC. Default uses the
     // foreground target. It cannot be set by a lower-privileged external client.
     LayoutTarget (*capture)() = CaptureLayoutTarget;
-    LedWorker::Operation ledOperation{};
+    // Fixed local privileged layout channel, selected by installed entry point.
+    // Never invoked from a hook. Portable/test engines do not use SYSTEM.
+    std::function<DWORD(LANGID)> systemApply{};
+    bool requireDesktopProfile = false;
 };
 
 class Engine {
@@ -38,6 +43,7 @@ public:
     // by the broker. The worker compares it immediately before applying.
     bool SetTargetIfRevision(core::Language language, std::uint64_t expectedUserRevision);
     bool RestartHook();
+    bool ProfileReport(LANGID language, std::uint64_t generation, DWORD error, bool manual);
     EngineStatus Status() const;
 private:
     struct Impl;

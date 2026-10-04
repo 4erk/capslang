@@ -81,6 +81,9 @@ int main() {
     Check(!Call(wrongSession, path, false, request, response, error) && error == ERROR_ACCESS_DENIED,
           "server in different claimed session rejected");
     Check(calls == before, "untrusted server checks precede request delivery");
+    auto wrongServerSid = endpoint; wrongServerSid.serverSid = L"S-1-5-18";
+    Check(!Call(wrongServerSid, path, false, request, response, error) && error == ERROR_ACCESS_DENIED,
+          "ordinary process cannot impersonate SYSTEM endpoint");
     auto bad = request; bad.magic ^= 1;
     Check(Malformed(endpoint, bad), "bad magic refused by actual server");
     bad = request; ++bad.version;
@@ -99,9 +102,27 @@ int main() {
     Check(Malformed(endpoint, bad), "status refuses an unexpected intent revision");
     bad = request; bad.operation = Operation::SetLayoutIfRevision; bad.language = kEnglish;
     Check(Malformed(endpoint, bad), "conditional update requires nonzero engine epoch");
+    bad = request; bad.operation = Operation::ReportProfile; bad.language = kEnglish;
+    Check(Malformed(endpoint, bad), "profile report requires an engine incarnation");
+    bad.engineEpoch = 1; bad.language = 0;
+    Check(Malformed(endpoint, bad), "unknown profile cannot be reported as successful");
+    bad.language = kEnglish; bad.reserved = ERROR_ACCESS_DENIED;
+    Check(Malformed(endpoint, bad), "successful profile and failure are mutually exclusive");
+    bad.language = 0; bad.reserved = UINT64_MAX;
+    Check(Malformed(endpoint, bad), "profile error is bounded to DWORD");
+    bad.operation = Operation::ManualProfile; bad.language = kEnglish; bad.reserved = 1;
+    Check(Malformed(endpoint, bad), "manual choice rejects hidden operation payload");
     Check(BadLength(endpoint, 8), "short frame disconnected");
     Check(BadLength(endpoint, 64), "oversized frame disconnected");
     Check(calls == before, "malformed requests never invoke handler");
+    Request profile;
+    profile.id = 900; profile.operation = Operation::ReportProfile;
+    profile.engineEpoch = 1; profile.expectedRevision = 2; profile.language = kRussian;
+    Check(Call(endpoint,path,false,profile,response,error), "well-formed generation-bound profile report accepted");
+    profile.language = 0; profile.reserved = ERROR_NOT_READY;
+    Check(Call(endpoint,path,false,profile,response,error), "explicit profile failure accepted without fictitious language");
+    profile.operation = Operation::ManualProfile; profile.language = kEnglish; profile.reserved = 0;
+    Check(Call(endpoint,path,false,profile,response,error), "well-formed manual profile choice accepted");
     HANDLE anonymous = INVALID_HANDLE_VALUE;
     const bool impersonated = ImpersonateAnonymousToken(GetCurrentThread()) != FALSE;
     DWORD anonymousError = 0;
@@ -133,6 +154,22 @@ int main() {
     Check(!Call(endpoint, path, false, request, response, error), "stopped server cannot answer");
     Check(server.Start(), "server restart releases first-instance ownership");
     server.Stop();
+    {
+        auto guarded = endpoint; guarded.clientImage = L"C:\\not-this-client.exe";
+        Server guard(guarded, handle); Check(guard.Start(), "image-authenticated endpoint starts");
+        Check(!Call(endpoint,path,false,request,response,error), "same-user wrong client image refused");
+        guard.Stop();
+        guarded.clientImage = path;
+        Server allowed(guarded, handle); Check(allowed.Start(), "exact-image endpoint starts");
+        Check(Call(endpoint,path,false,request,response,error), "exact image and SID client accepted");
+        allowed.Stop();
+        if (!ProcessElevation(GetCurrentProcessId()).elevated) {
+            guarded.requireClientElevation = true;
+            Server highOnly(guarded, handle); Check(highOnly.Start(), "elevated-only endpoint starts");
+            Check(!Call(endpoint,path,false,request,response,error), "medium same-image client refused at privileged endpoint");
+            highOnly.Stop();
+        }
+    }
     {
         MessageServer tooLarge(endpoint,8193,16,[](const void*,void*){});
         Check(!tooLarge.Start() && tooLarge.Error()==ERROR_INVALID_PARAMETER,"generic local messages enforce 8KiB maximum");

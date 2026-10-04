@@ -37,19 +37,29 @@ public:
         else Request(target_, Origin::Unlock, now);
     }
     bool Due(std::uint64_t now) const {
-        return !locked_ && state_ == ApplyState::Pending && attempts_ < 3 && now >= nextAttempt_;
+        return !locked_ && now >= nextAttempt_ &&
+            ((state_ == ApplyState::Pending && attempts_ < 3) || state_ == ApplyState::Failed);
     }
     void Sent(std::uint64_t generation, std::uint64_t now) {
-        if (generation != generation_ || state_ != ApplyState::Pending || locked_) return;
+        if (generation != generation_ || locked_) return;
+        if (state_ == ApplyState::Failed) { state_ = ApplyState::Pending; attempts_ = 0; start_ = now; }
+        if (state_ != ApplyState::Pending) return;
         ++attempts_;
         nextAttempt_ = now + (attempts_ == 1 ? 150 : 300);
     }
     void Observe(Language actual, std::uint64_t generation, std::uint64_t now) {
         if (generation != generation_ || locked_) return;
         actual_ = actual;
+        // An old success is not a permanent lease: losing either the window
+        // or profile confirmation must revoke Applied without inventing intent.
+        if (state_ == ApplyState::Applied && actual != target_) {
+            state_ = ApplyState::Pending;
+            attempts_ = 0;
+            start_ = nextAttempt_ = now;
+        }
         if (state_ != ApplyState::Pending) return;
         if (Supported(actual) && actual == target_) state_ = ApplyState::Applied;
-        else if (now - start_ >= 1000) state_ = ApplyState::Failed;
+        else if (now - start_ >= 1000) { state_ = ApplyState::Failed; nextAttempt_ = now + 1000; }
     }
     Language Target() const { return target_; }
     Language Actual() const { return actual_; }

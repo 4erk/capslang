@@ -8,7 +8,7 @@ enum class Phase : DWORD { Prepared = 1, Applying = 2, Committed = 3, RolledBack
 struct Record {
     Phase phase = Phase::Prepared;
     std::wstring sid, engineXml, engineSecurity, brokerXml, brokerSecurity;
-    bool hadExecutable = false, hadRule = false;
+    bool hadExecutable = false, hadRule = false, hadLayoutService = false;
     Hash before{}, after{};
 };
 bool Encode(const Record &value, std::vector<BYTE> &bytes);

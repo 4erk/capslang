@@ -4,8 +4,8 @@
 
 namespace capslang {
 // Ordinary broker -> same-user/same-session, validated executable engine.
-// ReadState consumes the elevated recipient adapter, not raw injected-mouse
-// counts or physicalAge. Real two-machine acceptance remains mandatory.
+// ReadState consumes explicit language-choice revisions and MWB presence.
+// Pointer activity is not synchronization authority. Live acceptance is separate.
 class EngineClient {
 public:
     EngineClient(std::wstring executable, ipc::Endpoint endpoint = ipc::Endpoint::Current(), bool requireElevation = true)

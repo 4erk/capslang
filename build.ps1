@@ -95,13 +95,13 @@ if ($AppDevOnly -or $Release) {
         '-static', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-Wl,--no-insert-timestamp')
     $appSources = @('app\control.cpp','app\broker.cpp','app\paths.cpp','app\tasks.cpp',
         'app\install_store.cpp','app\installer.cpp','app\migration.cpp','app\firewall.cpp',
-        'runtime\local_ipc.cpp','runtime\engine_client.cpp','platform\windows_support.cpp',
+        'runtime\local_ipc.cpp','runtime\system_layout.cpp','runtime\engine_client.cpp','platform\windows_support.cpp',
         'network\runtime.cpp','network\application_mode.cpp','network\paired_connection.cpp',
         'network\enrollment.cpp','network\session.cpp','network\lan.cpp',
         'network\pairing.cpp','network\tls.cpp','platform\private_store.cpp') |
         ForEach-Object { Join-Path $projectRoot ('src\' + $_) }
     $libs = @('-lole32','-loleaut32','-ltaskschd','-luuid','-luser32','-ladvapi32','-lsetupapi','-lshell32','-lcomctl32',
-        '-lws2_32','-liphlpapi','-lsecur32','-lcrypt32','-lncrypt','-lbcrypt','-lversion')
+        '-lws2_32','-liphlpapi','-lsecur32','-lcrypt32','-lncrypt','-lbcrypt','-lversion','-lwtsapi32')
     if (-not $SkipTests) {
         $appTest = Join-Path $appDir 'windows_app_tests.exe'
         & $compiler @flags (Join-Path $projectRoot 'tests\windows_app_tests.cpp') @appSources '-o' $appTest @libs
@@ -130,8 +130,7 @@ if ($AppDevOnly -or $Release) {
         (Join-Path $projectRoot 'src\app\saver.cpp') `
         (Join-Path $projectRoot 'src\app\window.cpp') @appSources `
         (Join-Path $projectRoot 'src\runtime\engine_host.cpp') (Join-Path $projectRoot 'src\runtime\engine.cpp') `
-        (Join-Path $projectRoot 'src\runtime\mwb_monitor.cpp') (Join-Path $projectRoot 'src\runtime\led_worker.cpp') `
-        (Join-Path $projectRoot 'src\platform\mwb.cpp') $resource '-o' $appExe @libs '-lwtsapi32' '-lversion' '-lwintrust'
+        $resource '-o' $appExe @libs '-lwtsapi32' '-lversion' '-lwintrust'
     if ($LASTEXITCODE -ne 0) { throw 'Development application compilation failed.' }
     if ($Release) {
         $releaseExe = Join-Path $distDir 'CapsLang.exe'
@@ -209,6 +208,10 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags (Join-Path $projectRoot 'tests\core_tests.cpp') '-o' $core
     if ($LASTEXITCODE -ne 0) { throw 'Core test compilation failed.' }
     Invoke-BoundedTest $core
+    $systemProtocol = Join-Path $integrationDir 'system_layout_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\system_layout_tests.cpp') '-o' $systemProtocol
+    if ($LASTEXITCODE -ne 0) { throw 'SYSTEM protocol compilation failed.' }
+    Invoke-BoundedTest $systemProtocol
     $settingsTest = Join-Path $integrationDir 'settings_tests.exe'
     & $compiler @flags (Join-Path $projectRoot 'tests\settings_tests.cpp') '-o' $settingsTest
     if ($LASTEXITCODE -ne 0) { throw 'Selective settings test compilation failed.' }
@@ -244,7 +247,6 @@ if ($RuntimeTestsOnly) {
         (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') $platform `
         (Join-Path $projectRoot 'src\runtime\engine.cpp') (Join-Path $projectRoot 'src\platform\mwb.cpp') `
         (Join-Path $projectRoot 'src\runtime\mwb_monitor.cpp') `
-        (Join-Path $projectRoot 'src\runtime\led_worker.cpp') `
         (Join-Path $projectRoot 'src\runtime\engine_host.cpp') `
         (Join-Path $projectRoot 'src\runtime\engine_client.cpp') `
         (Join-Path $projectRoot 'src\network\session.cpp') (Join-Path $projectRoot 'src\network\lan.cpp') `
@@ -298,22 +300,12 @@ if ($RuntimeTestsOnly) {
     if ($LASTEXITCODE -ne 0) { throw 'Network runtime compilation failed.' }
     Invoke-BoundedTest $networkRuntime
     if (-not $NetworkTestsOnly) {
-    $ledWorker = Join-Path $integrationDir 'windows_led_worker_tests.exe'
-    & $compiler @flags (Join-Path $projectRoot 'tests\windows_led_worker_tests.cpp') `
-        (Join-Path $projectRoot 'src\runtime\led_worker.cpp') $platform '-o' $ledWorker @libs
-    if ($LASTEXITCODE -ne 0) { throw 'LED worker compilation failed.' }
-    Invoke-BoundedTest $ledWorker
     $lanProbe = Join-Path $integrationDir 'lan_pair_probe.exe'
     & $compiler @flags '-municode' (Join-Path $projectRoot 'tools\lan_pair_probe.cpp') `
         (Join-Path $projectRoot 'src\network\lan.cpp') (Join-Path $projectRoot 'src\network\pairing.cpp') `
         (Join-Path $projectRoot 'src\network\tls.cpp') (Join-Path $projectRoot 'src\platform\private_store.cpp') `
         '-o' $lanProbe '-lws2_32' '-liphlpapi' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
     if ($LASTEXITCODE -ne 0) { throw 'Opt-in LAN probe compilation failed.' }
-    # Built but NEVER automatically run: this is the only hardware-writing test.
-    $led = Join-Path $integrationDir 'windows_led_integration.exe'
-    & $compiler @flags '-municode' (Join-Path $projectRoot 'tests\windows_led_integration.cpp') `
-        $platform '-o' $led @libs
-    if ($LASTEXITCODE -ne 0) { throw 'LED test compilation failed.' }
     }
     if ($runtimeFailures.Count) { throw ($runtimeFailures -join [Environment]::NewLine) }
     Write-Host 'Development components tested. No app installation or release artifact produced.'

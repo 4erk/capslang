@@ -1,5 +1,6 @@
 #include "installer.hpp"
 #include "../runtime/engine_client.hpp"
+#include "../runtime/system_layout.hpp"
 #include "control.hpp"
 #include "firewall.hpp"
 #include "install_store.hpp"
@@ -83,7 +84,7 @@ bool StopManaged(const std::wstring &executable, DWORD &error) {
         stop.id = GetTickCount64() + 1;
         stop.operation = ipc::Operation::Stop;
         ipc::Response response;
-        if (!ipc::Call(ipc::Endpoint::Current(), executable, true, stop, response, error) &&
+        if (!ipc::InstallationCall(ipc::Endpoint::Current(), executable, stop, response, error) &&
             !Missing(error) && error != ERROR_BROKEN_PIPE && error != ERROR_PIPE_NOT_CONNECTED)
             return false;
     }
@@ -97,7 +98,7 @@ bool StopManaged(const std::wstring &executable, DWORD &error) {
         query.id = control.id;
         ipc::Response response;
         const bool e =
-            ipc::Call(ipc::Endpoint::Current(), executable, true, query, response, engineError);
+            ipc::InstallationCall(ipc::Endpoint::Current(), executable, query, response, engineError);
         // The broker maintains the Guard. Stop it first so maintenance cannot
         // respawn the Guard while the installed image is being replaced.
         if (!b && !e && Missing(brokerError) && Missing(engineError))
@@ -144,19 +145,20 @@ bool StartRoles(Tasks &tasks, const std::wstring &executable, const ipc::Endpoin
                 DWORD &error) {
     if ((error = Hr(tasks.Start(TaskRole::Engine, executable, user.sid, user.session))))
         return false;
-    EngineClient engine(executable);
     ipc::Response response;
     const auto deadline = GetTickCount64() + 12000;
     bool healthy = false;
     do {
-        if (engine.Read(response) && (response.flags & 7U) == 7U && !response.hookError) {
+        ipc::Request request; request.id = GetTickCount64()+1;
+        if (ipc::InstallationCall(ipc::Endpoint::Current(),executable,request,response,error) &&
+            !response.error && (response.flags & 7U) == 7U && !response.hookError) {
             healthy = true;
             break;
         }
         Sleep(100);
     } while (GetTickCount64() < deadline);
     if (!healthy) {
-        error = engine.Error() ? engine.Error() : ERROR_NOT_READY;
+        if (!error) error = ERROR_NOT_READY;
         return false;
     }
     if ((error = Hr(tasks.Start(TaskRole::Broker, executable, user.sid, user.session))))
@@ -183,11 +185,34 @@ bool StartRoles(Tasks &tasks, const std::wstring &executable, const ipc::Endpoin
         error = ERROR_NOT_READY;
     return false;
 }
+bool LayoutServiceReady(const std::wstring& executable, DWORD& error) {
+    // The privileged endpoint authenticates the installed image, not the
+    // downloaded installer. Run that image's read-only check with no user data.
+    const auto deadline = GetTickCount64() + 12000;
+    do {
+        auto command = L"\"" + executable + L"\" --layout-check";
+        STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+            CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) { error = GetLastError(); return false; }
+        CloseHandle(process.hThread);
+        const DWORD wait = WaitForSingleObject(process.hProcess, 2000);
+        if (wait != WAIT_OBJECT_0) {
+            TerminateProcess(process.hProcess, ERROR_TIMEOUT); WaitForSingleObject(process.hProcess, 2000);
+            error = ERROR_TIMEOUT;
+        } else if (!GetExitCodeProcess(process.hProcess, &error)) error = GetLastError();
+        CloseHandle(process.hProcess);
+        if (!error) return true;
+        Sleep(100);
+    } while (GetTickCount64() < deadline);
+    return false;
+}
 bool RollBack(Tasks &tasks, const std::wstring &executable, const ipc::Endpoint &user,
               install::Record &record, DWORD &error) {
     const auto root = Root(executable);
     if (!StopManaged(executable, error))
         return false;
+    if (!system_layout::Stop(error)) return false;
     if (record.hadExecutable) {
         const auto backup = root + L"\\rollback-" + install::Hex(record.before) + L".exe";
         if (!SameFile(backup, record.before, error))
@@ -213,6 +238,9 @@ bool RollBack(Tasks &tasks, const std::wstring &executable, const ipc::Endpoint 
         return false;
     if (!record.hadExecutable && !ArchiveInstalled(executable, error))
         return false;
+    if (record.hadLayoutService) {
+        if (!system_layout::Install(error) || !system_layout::Start(error)) return false;
+    } else if (!system_layout::Remove(error)) return false;
     record.phase = install::Phase::RolledBack;
     if (!install::SaveRecord(root, record, error))
         return false;
@@ -326,6 +354,7 @@ DWORD AdminInstall(AdminAction action) {
     if (action == AdminAction::Uninstall) {
         if (!StopManaged(executable, error))
             return error;
+        if (!system_layout::Remove(error)) return error;
         if ((error = Hr(tasks.Remove(TaskRole::Engine, executable, user.sid))) ||
             (error = Hr(tasks.Remove(TaskRole::Broker, executable, user.sid))) ||
             (error = Hr(RemoveFirewallRule(executable, user.sid))))
@@ -346,6 +375,7 @@ DWORD AdminInstall(AdminAction action) {
     install::Record record;
     record.sid = user.sid;
     record.hadExecutable = Exists(executable);
+    if (!system_layout::Installed(record.hadLayoutService, error)) return error;
     bool existed = false;
     if ((error = Hr(tasks.Read(TaskRole::Engine, executable, user.sid, existed, record.engineXml,
                                record.engineSecurity))) ||
@@ -376,6 +406,7 @@ DWORD AdminInstall(AdminAction action) {
         record.phase = install::Phase::Applying;
         if (!install::SaveRecord(root, record, error) || !StopManaged(executable, error))
             return false;
+        if (!system_layout::Stop(error)) return false;
         if (!ArchiveInstalled(executable, error))
             return false;
         if (!install::CopyProtected(candidate, executable, copied, error) ||
@@ -384,6 +415,10 @@ DWORD AdminInstall(AdminAction action) {
                 error = ERROR_CRC;
             return false;
         }
+        if (!system_layout::Install(error) || !system_layout::Start(error)) return false;
+        // Demand readiness in the caller's actual console session, not merely
+        // SERVICE_RUNNING in session 0. Locked desktops intentionally cannot apply.
+        if (!LayoutServiceReady(executable, error)) return false;
         if ((error = Hr(tasks.Register(TaskRole::Engine, executable, user.sid))) ||
             (error = Hr(tasks.Register(TaskRole::Broker, executable, user.sid))) ||
             (error = Hr(EnsureFirewallRule(executable, user.sid))) ||
@@ -425,7 +460,8 @@ DWORD UserInstall(UserAction action) {
         }
         return 0;
     }
-    if (action == UserAction::Rollback || action == UserAction::RestoreLegacy) {
+    if (action == UserAction::Rollback) return ElevatedChild(AdminAction::Revert);
+    if (action == UserAction::RestoreLegacy) {
         const auto ready = CheckRestoreAvailable(action == UserAction::RestoreLegacy);
         if (ready)
             return ready;

@@ -68,34 +68,5 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-class KeyboardLeds {
-public:
-    struct Device {
-        std::wstring path;
-        HANDLE handle = INVALID_HANDLE_VALUE;
-        DWORD openError = ERROR_SUCCESS;
-        DWORD queryError = ERROR_SUCCESS;
-        USHORT unitId = 0;
-        USHORT flags = 0;
-        bool queried = false;
-    };
-
-    KeyboardLeds() = default;
-    ~KeyboardLeds();
-    KeyboardLeds(const KeyboardLeds&) = delete;
-    KeyboardLeds& operator=(const KeyboardLeds&) = delete;
-    void Discover();
-    const std::vector<Device>& Devices() const { return devices_; }
-    // Only the Scroll LED bit is changed. No keyboard input is synthesized.
-    bool SetScroll(size_t index, bool on, DWORD& error);
-    bool ReadFlags(size_t index, USHORT& flags, DWORD& error);
-    DWORD EnumerationError() const { return enumerationError_; }
-
-private:
-    void Close();
-    void Add(const std::wstring& path);
-    std::vector<Device> devices_;
-    DWORD enumerationError_ = ERROR_SUCCESS;
-};
 
 } // namespace capslang

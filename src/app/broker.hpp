@@ -7,6 +7,7 @@ struct BrokerDependencies {
     std::function<bool(ipc::Response &, DWORD &)> read;
     std::function<bool(ipc::Operation, DWORD &)> command;
     net::SessionEndpoint session;
+    std::function<bool(const ipc::Response&,LANGID,std::uint64_t,DWORD,bool)> profile;
 };
 // Application's ordinary role. UI and logs consume cached state; all IPC and
 // network waits run outside the UI and the keyboard hook. Test substitutions

@@ -1,7 +1,5 @@
 #include "engine.hpp"
-#include "led_worker.hpp"
-#include "recipient_input.hpp"
-#include "focus_target.hpp"
+#include "../platform/mwb_presence.hpp"
 #include "../core/keyboard.hpp"
 #include <objbase.h>
 #include <wtsapi32.h>
@@ -16,6 +14,7 @@ namespace {
 constexpr UINT kToggle = WM_APP + 21, kSet = WM_APP + 22, kManual = WM_APP + 23;
 constexpr UINT kStop = WM_APP + 24, kRehook = WM_APP + 25;
 constexpr UINT kConditionalSet = WM_APP + 26;
+constexpr UINT kProfile = WM_APP + 27, kProfileManual = WM_APP + 28;
 constexpr ULONG_PTR kLegacyInput = 0x434150534c414e47ULL, kLegacyProbe = 0x4341505350524f42ULL;
 constexpr wchar_t kEngineClass[] = L"CapsLang.Engine.1.1";
 constexpr wchar_t kRawClass[] = L"CapsLang.Engine.RawRelease.1.1";
@@ -38,11 +37,16 @@ struct Engine::Impl {
     EngineStatus status;
     core::LayoutState layout;
     LayoutTarget target;
-    FocusTarget focusTarget;
     std::unique_ptr<LayoutApplier> applier;
-    LedWorker leds;
-    MwbMonitor mwb;
-    RecipientInput recipient;
+    DWORD session = 0, mwbError = ERROR_NOT_READY;
+    bool mwbRunning = false;
+    ULONGLONG nextMwbSample = 0, lastUserChange = 0;
+    std::uint64_t lastPublishedRevision = 0;
+    std::uint64_t appliedGeneration = 0, profileGeneration = 0;
+    LANGID profileLanguage = 0;
+    DWORD profileError = ERROR_NOT_READY;
+    ULONGLONG profileSampled = 0;
+    core::Language observed = core::Language::Unknown;
     HANDLE worker = nullptr, workerReady = nullptr, stopEvent = nullptr, hook = nullptr, hookReady = nullptr;
     HDESK desktop = nullptr;
     std::atomic<HWND> window{nullptr};
@@ -60,10 +64,21 @@ struct Engine::Impl {
     explicit Impl(EngineOptions value) : options(value) {}
     void Publish() {
         const auto now = GetTickCount64();
-        const auto observation = mwb.Status();
-        recipient.Sample(observation, now, locked);
+        if (now >= nextMwbSample) {
+            mwbRunning = MwbRunningInSession(session, mwbError);
+            nextMwbSample = now + 500;
+        }
+        if (layout.UserRevision() != lastPublishedRevision) {
+            lastPublishedRevision = layout.UserRevision(); lastUserChange = now;
+        }
         std::lock_guard<std::mutex> guard(statusMutex);
-        status.target = layout.Target(); status.actual = layout.Actual(); status.apply = layout.State();
+        status.target = layout.Target(); status.actual = observed; status.apply = layout.State();
+        status.profileLanguage = profileLanguage; status.profileGeneration = profileGeneration;
+        status.profileError = profileError;
+        status.profileConfirmed = profileSampled && now - profileSampled < 1000 &&
+            profileGeneration == layout.Generation() && !profileError &&
+            profileLanguage == static_cast<LANGID>(layout.Target());
+        status.systemEnabled = static_cast<bool>(options.systemApply);
         status.generation = layout.Generation(); status.userRevision = layout.UserRevision();
         status.locked = locked; status.hookRegistered = installed.load();
         status.hookError = installError.load();
@@ -73,12 +88,12 @@ struct Engine::Impl {
         status.recoveries = recoveryCount.load(); status.lastRecovery = hookRecovered.load();
         status.lastPhysicalInput = physicalInput.load();
         status.lastInjectedKeyInput = injectedKeyInput.load();
-        status.activitySerial = recipient.State().Serial();
-        status.lastRecipientInput = recipient.State().Last();
-        status.mwbError = observation.error ? observation.error : observation.evidence.settings.error;
-        status.mwbRunning = observation.responsive && observation.evidence.applications;
-        status.recipientAvailable = observation.responsive && observation.evidence.RecipientObservationAllowed() &&
-            !observation.evidence.settings.relativeMouse;
+        // Existing fixed-size fields now carry explicit-choice serial/age;
+        // the peer session protocol is versioned for this changed meaning.
+        status.activitySerial = lastPublishedRevision;
+        status.lastRecipientInput = lastUserChange;
+        status.mwbError = mwbError; status.mwbRunning = mwbRunning;
+        status.recipientAvailable = false;
     }
     void Error(DWORD EngineStatus::*field, DWORD error) {
         std::lock_guard<std::mutex> guard(statusMutex);
@@ -91,7 +106,6 @@ struct Engine::Impl {
         const auto data = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(pointer);
         const bool own = data.dwExtraInfo == kLegacyInput || data.dwExtraInfo == kLegacyProbe;
         const LRESULT next = CallNextHookEx(nullptr, code, message, pointer);
-        self->recipient.Key(Down(message), (data.flags & LLKHF_INJECTED) != 0, next == 0, own, data.time, GetTickCount64());
         // Calling the rest of the chain FIRST lets MWB forward/suppress at the
         // source regardless of hook installation order. No duplicate local toggle.
         if (own || next != 0) return next;
@@ -115,25 +129,11 @@ struct Engine::Impl {
         if (decision.toggle) PostMessageW(owner, kToggle, 0, 0);
         return decision.suppress ? 1 : next;
     }
-    static LRESULT CALLBACK MouseHook(int code, WPARAM message, LPARAM pointer) {
-        Impl* self = hookOwner;
-        if (code != HC_ACTION || !self) return CallNextHookEx(nullptr, code, message, pointer);
-        const auto data = *reinterpret_cast<const MSLLHOOKSTRUCT*>(pointer);
-        const LRESULT next = CallNextHookEx(nullptr, code, message, pointer);
-        self->recipient.Mouse(data.time, GetTickCount64(), (data.flags & LLMHF_INJECTED) != 0, next == 0,
-            data.dwExtraInfo == kLegacyInput || data.dwExtraInfo == kLegacyProbe);
-        // Synthetic mouse events alone are never authoritative activity.
-        if (!next && !(data.flags & LLMHF_INJECTED)) self->physicalInput = GetTickCount64();
-        return next;
-    }
     static LRESULT CALLBACK RawRelease(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         if (message == WM_INPUT && hookOwner) {
             RAWINPUT data{}; UINT size = sizeof(data);
             const auto count = GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT,
                 &data, &size, sizeof(RAWINPUTHEADER));
-            if (count != UINT(-1) && count >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE) &&
-                data.header.dwType == RIM_TYPEMOUSE)
-                hookOwner->recipient.RawMouse(data, static_cast<DWORD>(GetMessageTime()), GetTickCount64());
             if (count != UINT(-1) && count >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) &&
                 data.header.dwType == RIM_TYPEKEYBOARD && data.data.keyboard.VKey == VK_CAPITAL &&
                 (data.data.keyboard.Flags & RI_KEY_BREAK)) {
@@ -150,7 +150,7 @@ struct Engine::Impl {
         std::vector<RAWINPUTDEVICE> devices(count);
         if (GetRegisteredRawInputDevices(devices.data(), &count, sizeof(RAWINPUTDEVICE)) == UINT(-1)) return;
         for (const auto& device : devices) {
-            if (device.usUsagePage == 1 && (device.usUsage == 6 || device.usUsage == 2) && device.hwndTarget == hwnd) {
+            if (device.usUsagePage == 1 && device.usUsage == 6 && device.hwndTarget == hwnd) {
                 // Raw Input is process-wide. Don't unregister another owner's
                 // newer registration during a sequential/overlapping test.
                 RAWINPUTDEVICE remove{1, device.usUsage, RIDEV_REMOVE, nullptr};
@@ -174,10 +174,10 @@ struct Engine::Impl {
             HWND_MESSAGE, nullptr, rawClass.hInstance, nullptr);
         self.rawError = rawWindow ? ERROR_SUCCESS : GetLastError();
         if (rawWindow) {
-            RAWINPUTDEVICE devices[]{{1, 6, RIDEV_INPUTSINK, rawWindow}, {1, 2, RIDEV_INPUTSINK, rawWindow}};
-            if (!RegisterRawInputDevices(devices, 2, sizeof(devices[0]))) self.rawError = GetLastError();
+            RAWINPUTDEVICE device{1, 6, RIDEV_INPUTSINK, rawWindow};
+            if (!RegisterRawInputDevices(&device, 1, sizeof(device))) self.rawError = GetLastError();
         }
-        HHOOK keyboard = nullptr, mouse = nullptr;
+        HHOOK keyboard = nullptr;
         ULONGLONG lastInstall = 0, retryAt = 0;
         DWORD delay = 1000;
         auto install = [&] {
@@ -185,7 +185,6 @@ struct Engine::Impl {
             // gap, and the Caps decision is retained through replacement.
             HHOOK newKeyboard = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, GetModuleHandleW(nullptr), 0);
             const DWORD error = newKeyboard ? 0 : GetLastError();
-            HHOOK newMouse = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
             if (newKeyboard) {
                 if (keyboard) UnhookWindowsHookEx(keyboard);
                 keyboard = newKeyboard;
@@ -193,7 +192,6 @@ struct Engine::Impl {
                 lastInstall = GetTickCount64(); delay = 1000;
                 self.rehookRequested = false;
             } else { retryAt = GetTickCount64() + delay; delay = delay < 15000 ? delay * 2 : 30000; }
-            if (newMouse) { if (mouse) UnhookWindowsHookEx(mouse); mouse = newMouse; }
             self.installError = error;
             self.installed = keyboard != nullptr;
         };
@@ -216,18 +214,9 @@ struct Engine::Impl {
         }
         if (timer) KillTimer(nullptr, timer);
         if (keyboard) UnhookWindowsHookEx(keyboard);
-        if (mouse) UnhookWindowsHookEx(mouse);
         if (rawWindow) { RemoveRawSink(rawWindow); DestroyWindow(rawWindow); }
         self.installed = false; self.hookThread = 0; hookOwner = nullptr;
         return 0;
-    }
-    void UpdateLeds() {
-        if (!options.hardwareLeds) return;
-        leds.Target(locked ? core::Language::Unknown : layout.Actual());
-        const auto report = leds.Status();
-        std::lock_guard<std::mutex> guard(statusMutex);
-        status.ledWritten = report.written; status.ledUnsupported = report.unsupported;
-        status.ledError = report.error;
     }
     void Tick() {
         // COM/TSF calls may pump this STA's window messages. Nested timers or
@@ -237,15 +226,17 @@ struct Engine::Impl {
         ticking = true;
         struct TickGuard { bool& active; ~TickGuard() { active = false; } } guard{ticking};
         const auto now = GetTickCount64();
-        if (locked) { UpdateLeds(); Publish(); return; }
-        const auto focus = focusTarget.Select(options.capture(), mwb.Status());
+        if (locked) { Publish(); return; }
+        const auto focus = options.capture();
         if (!TargetStillValid(focus)) {
+            observed = core::Language::Unknown;
             if (target.focus) { target = {}; layout.FocusChanged(now); }
             layout.Observe(core::Language::Unknown, layout.Generation(), now);
             Error(&EngineStatus::layoutError, ERROR_INVALID_WINDOW_HANDLE);
             Publish(); return;
         }
         const auto actual = static_cast<core::Language>(TargetLanguage(focus));
+        observed = actual;
         const bool focusChanged = focus.focus != target.focus || focus.threadId != target.threadId || focus.processId != target.processId;
         if (focusChanged) {
             target = focus;
@@ -257,7 +248,7 @@ struct Engine::Impl {
             } else if (now >= manualUntil) {
                 manualUntil = 0; layout.FocusChanged(now);
             } else { Publish(); return; }
-        } else if (!focusChanged && layout.State() != core::ApplyState::Pending &&
+        } else if (!options.requireDesktopProfile && !focusChanged && layout.State() != core::ApplyState::Pending &&
                    core::Supported(actual) && actual != layout.Actual()) {
             // External selector/manual change on the same target, not its
             // remembered language encountered during a focus transition.
@@ -267,7 +258,11 @@ struct Engine::Impl {
                 if (layout.State() == core::ApplyState::Applied) layout.FocusChanged(now);
             } else layout.Request(actual, core::Origin::Manual, now);
         }
-        layout.Observe(actual, layout.Generation(), now);
+        const bool profileOk = !options.requireDesktopProfile ||
+            (profileSampled && now - profileSampled < 1000 && profileGeneration == layout.Generation() &&
+             !profileError && profileLanguage == static_cast<LANGID>(layout.Target()));
+        layout.Observe(appliedGeneration == layout.Generation() && profileOk ? actual : core::Language::Unknown,
+                       layout.Generation(), now);
         // A previous inaccessible foreground (for example MWB's SYSTEM
         // helper) must not leave a stale error after actual application is
         // confirmed in the newly focused user window.
@@ -275,7 +270,18 @@ struct Engine::Impl {
             Error(&EngineStatus::layoutError, ERROR_SUCCESS);
         if (layout.Due(now)) {
             const auto generation = layout.Generation();
-            const auto request = applier->Request(target, FindLayout(static_cast<LANGID>(layout.Target())));
+            LayoutRequestResult request;
+            if (options.requireDesktopProfile) {
+                // Desktop TSF is activated by the ordinary broker. The high
+                // engine addresses only the current window, never toggles.
+                const auto hkl = FindLayout(static_cast<LANGID>(layout.Target()));
+                request.changeLanguage = request.activateProfile = S_OK;
+                if (!hkl || !TargetStillValid(target)) request.postError = ERROR_INVALID_WINDOW_HANDLE;
+                else {
+                    request.posted = PostMessageW(target.focus,WM_INPUTLANGCHANGEREQUEST,0,reinterpret_cast<LPARAM>(hkl)) != FALSE;
+                    request.postError = request.posted ? 0 : GetLastError();
+                }
+            } else request = applier->Request(target, FindLayout(static_cast<LANGID>(layout.Target())));
 #ifdef CAPSLANG_ENGINE_INTEGRATION
             if (request.changeMs + request.profileMs + request.cleanupMs > 100) {
                 std::printf("Engine slow request: change=%llu profile=%llu post=%llu ms generation=%llu\n",
@@ -284,10 +290,15 @@ struct Engine::Impl {
                 std::fflush(stdout);
             }
 #endif
-            Error(&EngineStatus::layoutError, request.postError);
+            DWORD error = request.postError;
+            if (error == ERROR_ACCESS_DENIED && options.systemApply)
+                error = options.systemApply(static_cast<LANGID>(layout.Target()));
+            else if (!error && FAILED(request.changeLanguage)) error = static_cast<DWORD>(request.changeLanguage);
+            else if (!error && FAILED(request.activateProfile)) error = static_cast<DWORD>(request.activateProfile);
+            Error(&EngineStatus::layoutError, error);
+            if (!error) appliedGeneration = generation;
             layout.Sent(generation, now);
         }
-        UpdateLeds();
         Publish();
     }
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
@@ -299,6 +310,21 @@ struct Engine::Impl {
         if (!self) return DefWindowProcW(hwnd, message, wp, lp);
         const auto now = GetTickCount64();
         switch (message) {
+        case kProfile: case kProfileManual:
+            if (static_cast<std::uint64_t>(lp) != self->layout.Generation()) return 0;
+            if (message == kProfileManual) {
+                const auto language = static_cast<core::Language>(wp & 0xffff);
+                if (core::Supported(language) && language != self->layout.Target()) {
+                    self->manualUntil = 0;
+                    self->layout.Request(language, core::Origin::Manual, now);
+                }
+            } else {
+                self->profileLanguage = static_cast<LANGID>(wp & 0xffff);
+                self->profileError = static_cast<DWORD>(wp >> 32);
+                self->profileGeneration = static_cast<std::uint64_t>(lp);
+                self->profileSampled = now;
+            }
+            self->Tick(); return 0;
         case WM_TIMER: self->Tick(); return 0;
         case kToggle:
             self->manualUntil = 0; self->ownApplyUntil = now + 1500;
@@ -318,10 +344,9 @@ struct Engine::Impl {
             self->manualBefore = self->layout.Target(); self->manualUntil = now + 700; return 0;
         case kRehook: self->rehookRequested = true; return 0;
         case kStop: self->stopping = true; SetEvent(self->stopEvent); return 0;
-        case WM_DEVICECHANGE: self->leds.Rediscover(); return 0;
         case WM_POWERBROADCAST:
             if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
-                self->rehookRequested = true; self->leds.Rediscover();
+                self->rehookRequested = true;
                 self->layout.FocusChanged(now);
             }
             return TRUE;
@@ -331,7 +356,7 @@ struct Engine::Impl {
             } else if (wp == WTS_SESSION_UNLOCK || wp == WTS_SESSION_LOGON ||
                        wp == WTS_CONSOLE_CONNECT || wp == WTS_REMOTE_CONNECT) {
                 self->locked = false; self->layout.Lock(false, now);
-                self->rehookRequested = true; self->leds.Rediscover();
+                self->rehookRequested = true;
             }
             self->Publish(); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -355,8 +380,7 @@ struct Engine::Impl {
         self.target = self.options.capture();
         self.layout.Initialize(static_cast<core::Language>(TargetLanguage(self.target)));
         self.layout.Request(self.layout.Target(), core::Origin::Startup, GetTickCount64());
-        self.mwb.Start(); // Failure disables recipient reconciliation, not local switching.
-        if (self.options.hardwareLeds && !self.leds.Start(self.options.ledOperation)) self.Error(&EngineStatus::ledError, self.leds.Error());
+        ProcessIdToSessionId(GetCurrentProcessId(), &self.session);
         self.wts = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) != FALSE;
         if (!self.wts) self.Error(&EngineStatus::sessionError, GetLastError());
         self.power = RegisterSuspendResumeNotification(hwnd, DEVICE_NOTIFY_WINDOW_HANDLE);
@@ -386,8 +410,6 @@ struct Engine::Impl {
         if (self.power) UnregisterSuspendResumeNotification(self.power);
         if (self.wts) WTSUnRegisterSessionNotification(hwnd);
         self.window = nullptr;
-        if (!self.leds.Stop()) self.Error(&EngineStatus::ledError, self.leds.Error());
-        self.mwb.Stop();
         DestroyWindow(hwnd);
         self.Publish();
         self.applier.reset(); // Release TSF on its owning STA before COM shutdown.
@@ -441,6 +463,12 @@ bool Engine::SetTarget(core::Language language) {
 bool Engine::RestartHook() {
     const HWND window = impl_->window.load();
     return window && !impl_->stopping && PostMessageW(window, kRehook, 0, 0) != FALSE;
+}
+bool Engine::ProfileReport(LANGID language, std::uint64_t generation, DWORD error, bool manual) {
+    const auto window = impl_->window.load();
+    const WPARAM value = (static_cast<WPARAM>(error) << 32) | language;
+    return window && !impl_->stopping && PostMessageW(window, manual ? kProfileManual : kProfile,
+        value, static_cast<LPARAM>(generation));
 }
 bool Engine::SetTargetIfRevision(core::Language language, std::uint64_t expectedUserRevision) {
     static_assert(sizeof(LPARAM) == sizeof(std::uint64_t), "CapsLang 1.1 requires x64");

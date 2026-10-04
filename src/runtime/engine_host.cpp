@@ -43,6 +43,11 @@ ipc::Response EngineHost::Handle(const ipc::Request& request) {
     ipc::Response response{};
     if (!ready_) { response.error = ERROR_NOT_READY; return response; }
     switch (request.operation) {
+    case ipc::Operation::ReportProfile: case ipc::Operation::ManualProfile:
+        if (request.engineEpoch != epoch_) response.error = ERROR_REVISION_MISMATCH;
+        else if (!engine_.ProfileReport(static_cast<LANGID>(request.language),request.expectedRevision,
+            static_cast<DWORD>(request.reserved),request.operation == ipc::Operation::ManualProfile)) response.error = ERROR_NOT_READY;
+        break;
     case ipc::Operation::SetLayoutIfRevision:
         if (request.engineEpoch != epoch_) response.error = ERROR_REVISION_MISMATCH;
         else if (!engine_.SetTargetIfRevision(static_cast<core::Language>(request.language), request.expectedRevision))
@@ -71,16 +76,16 @@ ipc::Response EngineHost::Handle(const ipc::Request& request) {
         (status.hookRegistered ? ipc::HookRegistered : 0U) |
         (status.hookThreadResponsive ? ipc::HookResponsive : 0U) |
         (status.locked ? ipc::Locked : 0U) |
-        (status.ledWritten ? ipc::LedWritten : 0U) |
-        (status.ledUnsupported ? ipc::LedPartial : 0U);
+        (status.profileConfirmed ? ipc::ProfileConfirmed : 0U) |
+        (status.systemEnabled ? ipc::SystemEnabled : 0U);
     response.hookError = status.hookError;
     response.layoutError = status.layoutError;
-    response.ledError = status.ledError;
+    response.profileError = status.profileError;
     response.generation = status.generation;
     response.revision = status.userRevision;
     response.recovery = status.lastRecovery;
-    response.physicalAge = Age(now, status.lastPhysicalInput);
-    response.injectedKeyAge = Age(now, status.lastInjectedKeyInput);
+    response.profileLanguage = status.profileLanguage;
+    response.profileGeneration = status.profileGeneration;
     response.engineEpoch = epoch_;
     response.activitySerial = status.activitySerial;
     response.activityAge = Age(now, status.lastRecipientInput);

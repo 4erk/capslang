@@ -136,7 +136,7 @@ const wchar_t *NetworkText(std::uint32_t phase) {
     case net::NetworkPhase::Connecting:
         return L"подключение";
     case net::NetworkPhase::AwaitInput:
-        return L"ожидание нового ввода для выбора языка";
+        return L"ожидание явного переключения языка";
     case net::NetworkPhase::Active:
         return L"соединение активно";
     case net::NetworkPhase::Error:
@@ -159,9 +159,12 @@ std::string StatusJson(const PublicStatus &s, std::uint64_t now) {
         << ",\"hook_responsive\":" << ((e.flags & ipc::HookResponsive) ? "true" : "false")
         << ",\"locked\":" << ((e.flags & ipc::Locked) ? "true" : "false")
         << ",\"hook_error\":" << e.hookError << ",\"layout_error\":" << e.layoutError
-        << ",\"led_error\":" << e.ledError
-        << ",\"led_written\":" << ((e.flags & ipc::LedWritten) ? "true" : "false")
-        << ",\"led_partial\":" << ((e.flags & ipc::LedPartial) ? "true" : "false")
+        << ",\"profile_error\":" << e.profileError
+        << ",\"profile_language\":" << e.profileLanguage
+        << ",\"profile_generation\":" << e.profileGeneration
+        << ",\"generation\":" << e.generation << ",\"revision\":" << e.revision
+        << ",\"profile_confirmed\":" << ((e.flags & ipc::ProfileConfirmed) ? "true" : "false")
+        << ",\"system_enabled\":" << ((e.flags & ipc::SystemEnabled) ? "true" : "false")
         << ",\"last_recovery_tick\":" << e.recovery << ",\"mwb_flags\":" << e.mwbFlags
         << ",\"mwb_error\":" << e.mwbError << ",\"network_phase\":" << s.networkPhase
         << ",\"network_error\":" << s.networkError
@@ -194,13 +197,11 @@ std::wstring StatusText(const PublicStatus &s, std::uint64_t now) {
             << L"; ошибка: " << e.hookError << L"\r\n"
             << L"Применение: " << ApplyText(e.apply) << L"; ошибка: " << e.layoutError << L"\r\n"
             << L"MWB: " << ((e.mwbFlags & ipc::MwbRunning) ? L"запущен" : L"не запущен")
-            << L"; получатель: "
-            << ((e.mwbFlags & ipc::RecipientAvailable) ? L"наблюдается" : L"не определён")
             << L"\r\n"
-            << L"LED: "
-            << ((e.flags & ipc::LedWritten) ? L"команда устройству принята (не оптическая проверка)"
-                                            : L"запись не подтверждена")
-            << L"; ошибка: " << e.ledError << L"\r\n";
+            << L"Системный профиль: " << LanguageText(static_cast<std::uint32_t>(e.profileLanguage))
+            << L"; подтверждение текущего запроса: " << ((e.flags & ipc::ProfileConfirmed) ? L"да" : L"нет")
+            << L"; ошибка: " << e.profileError << L"\r\n"
+            << L"Доступ к SYSTEM-окнам: " << ((e.flags & ipc::SystemEnabled) ? L"включён" : L"нет") << L"\r\n";
         if (e.recovery && now >= e.recovery)
             out << L"Восстановление hook: " << (now - e.recovery) / 1000 << L" сек. назад\r\n";
     }

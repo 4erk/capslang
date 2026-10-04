@@ -117,9 +117,9 @@ bool Encode(const Record &value, std::vector<BYTE> &bytes) {
     if (!Valid(value))
         return false;
     Number(bytes, 0x31494c43);
-    Number(bytes, 1);
+    Number(bytes, 2);
     Number(bytes, static_cast<DWORD>(value.phase));
-    Number(bytes, (value.hadExecutable ? 1U : 0U) | (value.hadRule ? 2U : 0U));
+    Number(bytes, (value.hadExecutable ? 1U : 0U) | (value.hadRule ? 2U : 0U) | (value.hadLayoutService ? 4U : 0U));
     bytes.insert(bytes.end(), value.before.begin(), value.before.end());
     bytes.insert(bytes.end(), value.after.begin(), value.after.end());
     for (const auto *s : {&value.sid, &value.engineXml, &value.engineSecurity, &value.brokerXml,
@@ -143,11 +143,13 @@ bool Decode(const std::vector<BYTE> &bytes, Record &value) {
     DWORD magic = 0, version = 0, phase = 0, flags = 0;
     Record r;
     if (!Number(bytes, at, magic) || !Number(bytes, at, version) || !Number(bytes, at, phase) ||
-        !Number(bytes, at, flags) || magic != 0x31494c43 || version != 1 || (flags & ~3U))
+        !Number(bytes, at, flags) || magic != 0x31494c43 || (version != 1 && version != 2) ||
+        (flags & ~(version == 1 ? 3U : 7U)))
         return false;
     r.phase = static_cast<Phase>(phase);
     r.hadExecutable = (flags & 1) != 0;
     r.hadRule = (flags & 2) != 0;
+    r.hadLayoutService = (flags & 4) != 0;
     memcpy(r.before.data(), bytes.data() + at, 32);
     at += 32;
     memcpy(r.after.data(), bytes.data() + at, 32);

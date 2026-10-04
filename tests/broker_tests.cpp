@@ -90,6 +90,18 @@ void Failures() {
         const auto out = broker.TakeOutput();
         Check(out.acknowledgement && out.acknowledgement->applied == Applied::Failed, "refused or unconfirmed application reports failure");
         Check(!out.apply, "failure never loops synthetic or unbounded retries");
+        const auto failedAt = queued ? 1600U : 101U;
+        broker.Observe(local, failedAt+499);
+        Check(!broker.TakeOutput().apply, "failed absolute request respects retry interval");
+        broker.Observe(local, failedAt+500);
+        auto retry = broker.TakeOutput();
+        Check(retry.apply && retry.apply->language == Language::Russian, "desired state survives queue or application failure");
+        if (retry.apply) Apply(local, *retry.apply);
+        broker.ApplyQueued(true); broker.Observe(local, failedAt+510);
+        retry = broker.TakeOutput();
+        Check(retry.acknowledgement && retry.acknowledgement->applied == Applied::Yes,
+              "retry acknowledged only after actual application");
+        local = State();
     }
     BrokerState disabled(IdOf(1), IdOf(2), IdOf(3), Language::English, local);
     local.snapshot.mwb = false;

@@ -3,8 +3,9 @@
 
 namespace capslang::sync {
 // Wire-independent reconciliation policy. All times are monotonic AGES, never
-// machine clock timestamps. The broker obtains these only from a verified
-// recipient observer; an arbitrary injected mouse event is not evidence.
+// machine clock timestamps. activitySerial/activity are retained wire field
+// names for the last EXPLICIT language choice. Pointer activity never enters
+// this model. A restarted process without an age waits for a fresh choice.
 struct Snapshot {
     std::uint64_t engineEpoch = 0, userRevision = 0, activitySerial = 0;
     Language language = Language::Unknown;

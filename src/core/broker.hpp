@@ -29,7 +29,8 @@ public:
           revision_(initial.snapshot.userRevision) {
         ready_ = replica_.Ready() && Valid(initial.snapshot) && initial.snapshot.mwb;
         if (Nonzero(initialAuthor) && !replica_.Seed(initialAuthor)) ready_ = false;
-        if (ready_ && initial.snapshot.language != agreed) pendingApply_ = true;
+        if (ready_ && (initial.snapshot.language != agreed || initial.actual != agreed ||
+            initial.apply != core::ApplyState::Applied)) pendingApply_ = true;
     }
     bool Ready() const { return ready_; }
     Language Target() const { return replica_.Target(); }
@@ -48,9 +49,12 @@ public:
             if (!replica_.Local(local.snapshot.language, update)) return Fail();
             revision_ = local.snapshot.userRevision; output_.update = update;
             output_.apply.reset(); pendingApply_ = false; waiting_ = false;
-            lastAck_.reset();
+            lastAck_.reset(); retryAt_ = 0;
         }
-        if (pendingApply_) {
+        const bool confirmed = !local.locked && local.snapshot.language == replica_.Target() &&
+            local.actual == replica_.Target() && local.apply == core::ApplyState::Applied;
+        if (confirmed) { pendingApply_ = false; waiting_ = false; }
+        if (pendingApply_ && !local.locked && local.apply != core::ApplyState::Locked && now >= retryAt_) {
             // Even a matching target needs actual confirmation; a previously
             // failed local attempt is not treated as already applied.
             if (local.snapshot.language != replica_.Target() || local.actual != replica_.Target() ||
@@ -64,7 +68,13 @@ public:
         if (local.locked || local.apply == core::ApplyState::Locked) result = Applied::Locked;
         else if (local.snapshot.language == replica_.Target() && local.actual == replica_.Target() &&
                  local.apply == core::ApplyState::Applied) { result = Applied::Yes; waiting_ = false; }
-        else if ((waiting_ && now >= deadline_) || (!waiting_ && local.apply == core::ApplyState::Failed)) result = Applied::Failed;
+        else if ((waiting_ && now >= deadline_) || (!waiting_ && local.apply == core::ApplyState::Failed)) {
+            result = Applied::Failed;
+            if (!pendingApply_) {
+                pendingApply_ = true;
+                retryAt_ = now > UINT64_MAX - 500 ? UINT64_MAX : now + 500;
+            }
+        }
         Message ack;
         if (replica_.Acknowledge(result, local.actual, ack) &&
             (!lastAck_ || !(lastAck_->version == ack.version) || lastAck_->applied != ack.applied)) {
@@ -81,7 +91,7 @@ public:
             // Drop an unsent update that has already lost the deterministic
             // conflict. A newer local revision will produce a newer update.
             output_.update.reset(); output_.acknowledgement.reset(); output_.apply.reset();
-            lastAck_.reset(); pendingApply_ = true; waiting_ = false;
+            lastAck_.reset(); pendingApply_ = true; waiting_ = false; retryAt_ = 0;
             return Observe(local, now);
         }
         // Duplicates and stale packets never issue another engine command.
@@ -95,7 +105,7 @@ public:
 private:
     bool Fail() { ready_ = false; output_ = {}; return false; }
     Replica replica_;
-    std::uint64_t epoch_ = 0, revision_ = 0, deadline_ = 0, lastTime_ = 0;
+    std::uint64_t epoch_ = 0, revision_ = 0, deadline_ = 0, lastTime_ = 0, retryAt_ = 0;
     bool ready_ = false, pendingApply_ = false, waiting_ = false, haveTime_ = false;
     std::optional<Message> lastAck_;
     BrokerOutput output_;

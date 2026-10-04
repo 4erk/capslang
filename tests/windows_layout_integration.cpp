@@ -839,6 +839,36 @@ void EngineTests(const std::wstring& desktop) {
     Check(!call() && response.error == ERROR_REVISION_MISMATCH,
           "old broker request rejected after restart even when revision numbers match");
     host.Stop();
+    {
+        HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr), release = CreateEventW(nullptr, TRUE, FALSE, nullptr), returned = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        Check(entered && release && returned, "engine stalled-LED fixture events created");
+        EngineOptions isolatedLed{true, CaptureFixture};
+        isolatedLed.ledOperation = [&](Language, bool) {
+            SetEvent(entered); WaitForSingleObject(release, INFINITE); SetEvent(returned);
+            return LedStatus{1, 0, 0, true};
+        };
+        Engine withBlockedLed(isolatedLed);
+        Check(withBlockedLed.Start() && PumpUntil([&] { return WaitForSingleObject(entered, 0) == WAIT_OBJECT_0; }),
+              "production engine reaches controlled stalled LED operation without writing hardware");
+        Check(withBlockedLed.SetTarget(Language::English) && PumpUntil([&] {
+            return withBlockedLed.Status().actual == Language::English && TargetLanguage(second.Target()) == kEnglish;
+        }), "stalled LED driver cannot block real EN application");
+        Check(withBlockedLed.SetTarget(Language::Russian) && PumpUntil([&] {
+            return withBlockedLed.Status().actual == Language::Russian && TargetLanguage(second.Target()) == kRussian;
+        }), "stalled LED driver cannot block subsequent RU application");
+        Check(PumpUntil([&] { return withBlockedLed.Status().ledError == ERROR_TIMEOUT; }, 2500),
+              "engine reports stalled LED instead of hiding device failure");
+        const auto began = GetTickCount64(); withBlockedLed.Stop();
+        Check(GetTickCount64() - began < 1500 && !withBlockedLed.Status().hookRegistered,
+              "engine shutdown removes hooks without waiting indefinitely on LED driver");
+        SetEvent(release);
+        Check(WaitForSingleObject(returned, 1000) == WAIT_OBJECT_0, "isolated LED context survives bounded engine shutdown safely");
+        // Wait for callback destruction before closing its fixture handles.
+        LedWorker slot;
+        Check(PumpUntil([&] { return slot.Start([](Language, bool) { return LedStatus{}; }); }), "LED ownership slot released after real completion");
+        slot.Stop();
+        CloseHandle(entered); CloseHandle(release); CloseHandle(returned);
+    }
     capturedWindow = nullptr;
 }
 #endif

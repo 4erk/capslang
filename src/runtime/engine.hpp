@@ -1,6 +1,7 @@
 #pragma once
 #include "../platform/windows_support.hpp"
 #include "../core/layout.hpp"
+#include "led_worker.hpp"
 #include <memory>
 
 namespace capslang {
@@ -18,6 +19,7 @@ struct EngineOptions {
     // Test dependency supplied by code, not by CLI or IPC. Default uses the
     // foreground target. It cannot be set by a lower-privileged external client.
     LayoutTarget (*capture)() = CaptureLayoutTarget;
+    LedWorker::Operation ledOperation{};
 };
 
 class Engine {

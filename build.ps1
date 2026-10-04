@@ -158,6 +158,7 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags '-municode' '-DCAPSLANG_ENGINE_INTEGRATION' `
         (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') $platform `
         (Join-Path $projectRoot 'src\runtime\engine.cpp') (Join-Path $projectRoot 'src\platform\mwb.cpp') `
+        (Join-Path $projectRoot 'src\runtime\led_worker.cpp') `
         (Join-Path $projectRoot 'src\runtime\engine_host.cpp') `
         (Join-Path $projectRoot 'src\runtime\engine_client.cpp') `
         (Join-Path $projectRoot 'src\network\session.cpp') (Join-Path $projectRoot 'src\network\lan.cpp') `
@@ -195,6 +196,11 @@ if ($RuntimeTestsOnly) {
         '-o' $session '-lws2_32' '-liphlpapi' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
     if ($LASTEXITCODE -ne 0) { throw 'Broker session test compilation failed.' }
     Invoke-BoundedTest $session
+    $ledWorker = Join-Path $integrationDir 'windows_led_worker_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\windows_led_worker_tests.cpp') `
+        (Join-Path $projectRoot 'src\runtime\led_worker.cpp') $platform '-o' $ledWorker @libs
+    if ($LASTEXITCODE -ne 0) { throw 'LED worker compilation failed.' }
+    Invoke-BoundedTest $ledWorker
     $lanProbe = Join-Path $integrationDir 'lan_pair_probe.exe'
     & $compiler @flags '-municode' (Join-Path $projectRoot 'tools\lan_pair_probe.cpp') `
         (Join-Path $projectRoot 'src\network\lan.cpp') (Join-Path $projectRoot 'src\network\pairing.cpp') `

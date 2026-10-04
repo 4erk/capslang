@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "led_worker.hpp"
 #include "../core/keyboard.hpp"
 #include <objbase.h>
 #include <wtsapi32.h>
@@ -35,7 +36,7 @@ struct Engine::Impl {
     core::LayoutState layout;
     LayoutTarget target;
     std::unique_ptr<LayoutApplier> applier;
-    KeyboardLeds leds;
+    LedWorker leds;
     HANDLE worker = nullptr, workerReady = nullptr, stopEvent = nullptr, hook = nullptr, hookReady = nullptr;
     HDESK desktop = nullptr;
     std::atomic<HWND> window{nullptr};
@@ -46,7 +47,7 @@ struct Engine::Impl {
     core::KeyboardState keys;
     HPOWERNOTIFY power = nullptr;
     bool wts = false, locked = false, ticking = false;
-    ULONGLONG manualUntil = 0, ownApplyUntil = 0, ledNextDiscovery = 0, ledNextCheck = 0;
+    ULONGLONG manualUntil = 0, ownApplyUntil = 0;
     core::Language manualBefore = core::Language::Unknown;
     static thread_local Impl* hookOwner;
 
@@ -158,22 +159,13 @@ struct Engine::Impl {
         self.installed = false; self.hookThread = 0; hookOwner = nullptr;
         return 0;
     }
-    void UpdateLeds(ULONGLONG now) {
-        if (!options.hardwareLeds || now < ledNextCheck || !core::Supported(layout.Actual())) return;
-        ledNextCheck = now + 500;
-        if (now >= ledNextDiscovery) { leds.Discover(); ledNextDiscovery = now + 10000; }
-        unsigned written = 0, unsupported = 0;
-        DWORD lastError = 0;
-        for (size_t i = 0; i < leds.Devices().size(); ++i) {
-            const auto& device = leds.Devices()[i];
-            if (!device.queried || device.path.find(L"GLOBALROOT") == std::wstring::npos) continue;
-            DWORD error = 0;
-            if (leds.SetScroll(i, layout.Actual() == core::Language::Russian, error)) ++written;
-            else { ++unsupported; lastError = error; }
-        }
+    void UpdateLeds() {
+        if (!options.hardwareLeds) return;
+        leds.Target(locked ? core::Language::Unknown : layout.Actual());
+        const auto report = leds.Status();
         std::lock_guard<std::mutex> guard(statusMutex);
-        status.ledWritten = written; status.ledUnsupported = unsupported;
-        status.ledError = lastError ? lastError : (written ? 0 : ERROR_NOT_SUPPORTED);
+        status.ledWritten = report.written; status.ledUnsupported = report.unsupported;
+        status.ledError = report.error;
     }
     void Tick() {
         // COM/TSF calls may pump this STA's window messages. Nested timers or
@@ -183,7 +175,7 @@ struct Engine::Impl {
         ticking = true;
         struct TickGuard { bool& active; ~TickGuard() { active = false; } } guard{ticking};
         const auto now = GetTickCount64();
-        if (locked) { Publish(); return; }
+        if (locked) { UpdateLeds(); Publish(); return; }
         const auto focus = options.capture();
         if (!TargetStillValid(focus)) {
             if (target.focus) { target = {}; layout.FocusChanged(now); }
@@ -228,7 +220,7 @@ struct Engine::Impl {
             Error(&EngineStatus::layoutError, request.postError);
             layout.Sent(generation, now);
         }
-        UpdateLeds(now);
+        UpdateLeds();
         Publish();
     }
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
@@ -259,10 +251,10 @@ struct Engine::Impl {
             self->manualBefore = self->layout.Target(); self->manualUntil = now + 700; return 0;
         case kRehook: self->rehookRequested = true; return 0;
         case kStop: self->stopping = true; SetEvent(self->stopEvent); return 0;
-        case WM_DEVICECHANGE: self->ledNextDiscovery = 0; return 0;
+        case WM_DEVICECHANGE: self->leds.Rediscover(); return 0;
         case WM_POWERBROADCAST:
             if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
-                self->rehookRequested = true; self->ledNextDiscovery = 0;
+                self->rehookRequested = true; self->leds.Rediscover();
                 self->layout.FocusChanged(now);
             }
             return TRUE;
@@ -272,7 +264,7 @@ struct Engine::Impl {
             } else if (wp == WTS_SESSION_UNLOCK || wp == WTS_SESSION_LOGON ||
                        wp == WTS_CONSOLE_CONNECT || wp == WTS_REMOTE_CONNECT) {
                 self->locked = false; self->layout.Lock(false, now);
-                self->rehookRequested = true; self->ledNextDiscovery = 0;
+                self->rehookRequested = true; self->leds.Rediscover();
             }
             self->Publish(); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -296,6 +288,7 @@ struct Engine::Impl {
         self.target = self.options.capture();
         self.layout.Initialize(static_cast<core::Language>(TargetLanguage(self.target)));
         self.layout.Request(self.layout.Target(), core::Origin::Startup, GetTickCount64());
+        if (self.options.hardwareLeds && !self.leds.Start(self.options.ledOperation)) self.Error(&EngineStatus::ledError, self.leds.Error());
         self.wts = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) != FALSE;
         if (!self.wts) self.Error(&EngineStatus::sessionError, GetLastError());
         self.power = RegisterSuspendResumeNotification(hwnd, DEVICE_NOTIFY_WINDOW_HANDLE);
@@ -325,6 +318,7 @@ struct Engine::Impl {
         if (self.power) UnregisterSuspendResumeNotification(self.power);
         if (self.wts) WTSUnRegisterSessionNotification(hwnd);
         self.window = nullptr;
+        if (!self.leds.Stop()) self.Error(&EngineStatus::ledError, self.leds.Error());
         DestroyWindow(hwnd);
         self.Publish();
         self.applier.reset(); // Release TSF on its owning STA before COM shutdown.

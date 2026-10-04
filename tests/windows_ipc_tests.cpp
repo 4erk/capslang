@@ -133,6 +133,18 @@ int main() {
     Check(!Call(endpoint, path, false, request, response, error), "stopped server cannot answer");
     Check(server.Start(), "server restart releases first-instance ownership");
     server.Stop();
+    {
+        MessageServer tooLarge(endpoint,8193,16,[](const void*,void*){});
+        Check(!tooLarge.Start() && tooLarge.Error()==ERROR_INVALID_PARAMETER,"generic local messages enforce 8KiB maximum");
+        MessageServer zero(endpoint,0,16,[](const void*,void*){});
+        Check(!zero.Start(),"generic local messages reject zero size");
+    }
+    {
+        MessageServer throwing(endpoint,sizeof(Request),sizeof(Response),[](const void*,void*){throw 1;});
+        Check(throwing.Start(),"exception fixture starts");
+        Check(!Call(endpoint,path,false,request,response,error),"throwing handler cannot publish partial or uninitialized response");
+        throwing.Stop();
+    }
     std::printf("Windows IPC: %u checks, %u failures; no hooks, layout changes or install.\n", checks, failures);
     return failures ? 1 : 0;
 }

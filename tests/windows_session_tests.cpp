@@ -1,4 +1,4 @@
-#include "../src/network/session.hpp"
+#include "../src/network/paired_connection.hpp"
 #include "../src/network/lan.hpp"
 #include <mutex>
 #include <thread>
@@ -81,15 +81,25 @@ struct Connection {
         accepted.Reset(accept(listener.Get(), nullptr, nullptr)); if (!accepted) return false;
         listener.Reset();
         serverThread = std::thread([&, this] {
-            TlsChannel tls(accepted.Get(), cancel); serverHandshake = tls.Handshake(serverIdentity, true, clientIdentity.Fingerprint());
-            if (serverHandshake) RunSession(tls, serverIdentity, true, server.Endpoint(), cancel, serverError);
-            else serverError = tls.Error();
+            TlsChannel tls(accepted.Get(), cancel);
+            const PairRecord pair{serverIdentity.Fingerprint(),clientIdentity.Fingerprint(),"test-listener",42519,true};
+            auto endpoint = server.Endpoint(); const auto publish = endpoint.publish;
+            endpoint.publish = [&](const SessionStatus& value) {
+                if (value.phase == SessionPhase::Active) serverHandshake = tls.Paired();
+                publish(value);
+            };
+            ServePairedConnection(tls,serverIdentity,pair,endpoint,cancel,serverError);
             shutdown(accepted.Get(), SD_BOTH);
         });
         clientThread = std::thread([&, this] {
-            TlsChannel tls(client.Get(), cancel); clientHandshake = tls.Handshake(clientIdentity, false, serverIdentity.Fingerprint());
-            if (clientHandshake) RunSession(tls, clientIdentity, false, peer.Endpoint(), cancel, clientError);
-            else clientError = tls.Error();
+            TlsChannel tls(client.Get(), cancel);
+            const PairRecord pair{clientIdentity.Fingerprint(),serverIdentity.Fingerprint(),"test-listener",42519,false};
+            auto endpoint = peer.Endpoint(); const auto publish = endpoint.publish;
+            endpoint.publish = [&](const SessionStatus& value) {
+                if (value.phase == SessionPhase::Active) clientHandshake = tls.Paired();
+                publish(value);
+            };
+            OpenPairedConnection(tls,clientIdentity,pair,endpoint,cancel,clientError);
             shutdown(client.Get(), SD_BOTH);
         });
         return true;

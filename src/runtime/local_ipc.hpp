@@ -43,6 +43,26 @@ struct Endpoint {
     DWORD session = 0, error = 0;
     static Endpoint Current(const std::wstring& instance = L"1.1");
 };
+// Fixed-size local messages share authentication, limits and cancellation.
+// Each protocol MUST validate its own magic/version/operations in the handler.
+// Never use this as arbitrary file, command or input forwarding.
+class MessageServer {
+public:
+    using Handler = std::function<void(const void*, void*)>;
+    MessageServer(Endpoint endpoint, DWORD requestBytes, DWORD responseBytes, Handler handler);
+    ~MessageServer();
+    MessageServer(const MessageServer&) = delete;
+    MessageServer& operator=(const MessageServer&) = delete;
+    bool Start();
+    void Stop();
+    DWORD Error() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+bool Exchange(const Endpoint& endpoint, const std::wstring& expectedServerPath,
+              bool requireElevation, const void* request, DWORD requestBytes,
+              void* response, DWORD responseBytes, DWORD& error);
 class Server {
 public:
     using Handler = std::function<Response(const Request&)>;
@@ -52,8 +72,7 @@ public:
     void Stop();
     DWORD Error() const;
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    MessageServer transport_;
 };
 // The application passes the protected installed EXE path and requires an
 // elevated server. Tests may explicitly use their own EXE and medium token.

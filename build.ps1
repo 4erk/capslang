@@ -5,6 +5,8 @@ param(
     [switch]$ProbeOnly,
     [switch]$IntegrationOnly,
     [switch]$RuntimeTestsOnly,
+    [switch]$NetworkTestsOnly,
+    [switch]$AppDevOnly,
     [switch]$SaverGuardOnly,
     [switch]$RecipientProbeOnly
 )
@@ -12,9 +14,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $SaverGuardOnly, $RecipientProbeOnly) | Where-Object { $_ }).Count -gt 1) {
+if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $NetworkTestsOnly, $AppDevOnly, $SaverGuardOnly, $RecipientProbeOnly) | Where-Object { $_ }).Count -gt 1) {
     throw 'Choose only one development build mode.'
 }
+if ($NetworkTestsOnly) { $RuntimeTestsOnly = $true }
 # Some WSL hosts inherit PATHEXT=.CPL. PowerShell then fails to wait for .exe
 # invocations or set LASTEXITCODE. Repair only this build process, and restore
 # the caller's environment even on failure or an early return.
@@ -36,7 +39,9 @@ $downloadUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$toolVe
 $expectedSha256 = 'b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35'
 
 if ($Clean) {
-    if ($RecipientProbeOnly) {
+    if ($AppDevOnly) {
+        Remove-Item -LiteralPath (Join-Path $buildDir 'app-dev') -Recurse -Force -ErrorAction SilentlyContinue
+    } elseif ($RecipientProbeOnly) {
         Remove-Item -LiteralPath (Join-Path $buildDir 'recipient-probe') -Recurse -Force -ErrorAction SilentlyContinue
     } elseif ($SaverGuardOnly) {
         Remove-Item -LiteralPath (Join-Path $buildDir 'saver-guard') -Recurse -Force -ErrorAction SilentlyContinue
@@ -77,6 +82,54 @@ if (-not (Test-Path -LiteralPath $compiler)) {
 }
 if (-not (Test-Path -LiteralPath $windres)) {
     throw "Resource compiler not found after extraction: $windres"
+}
+
+if ($AppDevOnly) {
+    $appDir = Join-Path $buildDir 'app-dev'
+    New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+    $flags = @('-std=c++17', '-O2', '-DNDEBUG', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00',
+        '-static', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-Wl,--no-insert-timestamp')
+    $appSources = @('app\control.cpp','app\broker.cpp','app\paths.cpp','app\tasks.cpp',
+        'runtime\local_ipc.cpp','runtime\engine_client.cpp','platform\windows_support.cpp',
+        'network\runtime.cpp','network\application_mode.cpp','network\paired_connection.cpp',
+        'network\enrollment.cpp','network\session.cpp','network\lan.cpp',
+        'network\pairing.cpp','network\tls.cpp','platform\private_store.cpp') |
+        ForEach-Object { Join-Path $projectRoot ('src\' + $_) }
+    $libs = @('-lole32','-loleaut32','-ltaskschd','-luuid','-luser32','-ladvapi32','-lsetupapi','-lshell32','-lcomctl32',
+        '-lws2_32','-liphlpapi','-lsecur32','-lcrypt32','-lncrypt','-lbcrypt')
+    if (-not $SkipTests) {
+        $appTest = Join-Path $appDir 'windows_app_tests.exe'
+        & $compiler @flags (Join-Path $projectRoot 'tests\windows_app_tests.cpp') @appSources '-o' $appTest @libs
+        if ($LASTEXITCODE -ne 0) { throw 'Application test compilation failed.' }
+        $test = New-Object System.Diagnostics.Process
+        $test.StartInfo.FileName = $appTest
+        $test.StartInfo.UseShellExecute = $false
+        $test.StartInfo.CreateNoWindow = $true
+        $test.StartInfo.RedirectStandardOutput = $true
+        $test.StartInfo.RedirectStandardError = $true
+        try {
+            if (-not $test.Start()) { throw 'Cannot start app tests.' }
+            $stdoutTask = $test.StandardOutput.ReadToEndAsync()
+            $stderrTask = $test.StandardError.ReadToEndAsync()
+            if (-not $test.WaitForExit(45000)) { $test.Kill(); $test.WaitForExit(); throw 'App tests exceeded 45 seconds.' }
+            Write-Host $stdoutTask.Result
+            if ($stderrTask.Result) { Write-Host $stderrTask.Result }
+            if ($test.ExitCode -ne 0) { throw 'App tests failed.' }
+        } finally { $test.Dispose() }
+    }
+    $resource = Join-Path $appDir 'app.res'
+    & $windres (Join-Path $projectRoot 'src\app\app.rc') '-I' (Join-Path $projectRoot 'src\app') '-O' 'coff' '-o' $resource
+    if ($LASTEXITCODE -ne 0) { throw 'App resource compilation failed.' }
+    $appExe = Join-Path $appDir 'CapsLang.exe'
+    & $compiler @flags '-s' '-municode' '-mwindows' (Join-Path $projectRoot 'src\app\main.cpp') `
+        (Join-Path $projectRoot 'src\app\window.cpp') @appSources `
+        (Join-Path $projectRoot 'src\runtime\engine_host.cpp') (Join-Path $projectRoot 'src\runtime\engine.cpp') `
+        (Join-Path $projectRoot 'src\runtime\mwb_monitor.cpp') (Join-Path $projectRoot 'src\runtime\led_worker.cpp') `
+        (Join-Path $projectRoot 'src\platform\mwb.cpp') $resource '-o' $appExe @libs '-lwtsapi32' '-lversion' '-lwintrust'
+    if ($LASTEXITCODE -ne 0) { throw 'Development application compilation failed.' }
+    Write-Host "Built development app (NOT installed or release-ready): $appExe"
+    Write-Host "SHA256: $((Get-FileHash -LiteralPath $appExe -Algorithm SHA256).Hash)"
+    return
 }
 
 if ($RecipientProbeOnly) {
@@ -139,6 +192,7 @@ if ($RuntimeTestsOnly) {
             if ($test.ExitCode -ne 0) { $runtimeFailures.Add("Test failed: $Path") }
         } finally { $test.Dispose() }
     }
+    if (-not $NetworkTestsOnly) {
     $core = Join-Path $integrationDir 'core_tests.exe'
     & $compiler @flags (Join-Path $projectRoot 'tests\core_tests.cpp') '-o' $core
     if ($LASTEXITCODE -ne 0) { throw 'Core test compilation failed.' }
@@ -193,11 +247,14 @@ if ($RuntimeTestsOnly) {
         (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') $platform '-o' $ipc @libs
     if ($LASTEXITCODE -ne 0) { throw 'IPC test compilation failed.' }
     Invoke-BoundedTest $ipc
+    }
     $tls = Join-Path $integrationDir 'windows_tls_tests.exe'
     & $compiler @flags '-municode' (Join-Path $projectRoot 'tests\windows_tls_tests.cpp') `
         (Join-Path $projectRoot 'src\network\tls.cpp') (Join-Path $projectRoot 'src\platform\private_store.cpp') `
         (Join-Path $projectRoot 'src\network\pairing.cpp') `
         (Join-Path $projectRoot 'src\network\enrollment.cpp') `
+        (Join-Path $projectRoot 'src\network\application_mode.cpp') (Join-Path $projectRoot 'src\network\paired_connection.cpp') `
+        (Join-Path $projectRoot 'src\network\session.cpp') `
         '-o' $tls '-lws2_32' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
     if ($LASTEXITCODE -ne 0) { throw 'TLS test compilation failed.' }
     Invoke-BoundedTest $tls
@@ -210,12 +267,25 @@ if ($RuntimeTestsOnly) {
     Invoke-BoundedTest $lan
     $session = Join-Path $integrationDir 'windows_session_tests.exe'
     & $compiler @flags (Join-Path $projectRoot 'tests\windows_session_tests.cpp') `
+        (Join-Path $projectRoot 'src\network\application_mode.cpp') (Join-Path $projectRoot 'src\network\paired_connection.cpp') `
+        (Join-Path $projectRoot 'src\network\enrollment.cpp') `
         (Join-Path $projectRoot 'src\network\session.cpp') (Join-Path $projectRoot 'src\network\lan.cpp') `
         (Join-Path $projectRoot 'src\network\pairing.cpp') (Join-Path $projectRoot 'src\network\tls.cpp') `
         (Join-Path $projectRoot 'src\platform\private_store.cpp') `
         '-o' $session '-lws2_32' '-liphlpapi' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
     if ($LASTEXITCODE -ne 0) { throw 'Broker session test compilation failed.' }
     Invoke-BoundedTest $session
+    $networkRuntime = Join-Path $integrationDir 'windows_network_runtime_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\windows_network_runtime_tests.cpp') `
+        (Join-Path $projectRoot 'src\network\runtime.cpp') `
+        (Join-Path $projectRoot 'src\network\application_mode.cpp') (Join-Path $projectRoot 'src\network\paired_connection.cpp') `
+        (Join-Path $projectRoot 'src\network\enrollment.cpp') (Join-Path $projectRoot 'src\network\session.cpp') `
+        (Join-Path $projectRoot 'src\network\lan.cpp') (Join-Path $projectRoot 'src\network\pairing.cpp') `
+        (Join-Path $projectRoot 'src\network\tls.cpp') (Join-Path $projectRoot 'src\platform\private_store.cpp') `
+        '-o' $networkRuntime '-lws2_32' '-liphlpapi' '-lsecur32' '-lcrypt32' '-lncrypt' '-lbcrypt' '-ladvapi32'
+    if ($LASTEXITCODE -ne 0) { throw 'Network runtime compilation failed.' }
+    Invoke-BoundedTest $networkRuntime
+    if (-not $NetworkTestsOnly) {
     $ledWorker = Join-Path $integrationDir 'windows_led_worker_tests.exe'
     & $compiler @flags (Join-Path $projectRoot 'tests\windows_led_worker_tests.cpp') `
         (Join-Path $projectRoot 'src\runtime\led_worker.cpp') $platform '-o' $ledWorker @libs
@@ -232,6 +302,7 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags '-municode' (Join-Path $projectRoot 'tests\windows_led_integration.cpp') `
         $platform '-o' $led @libs
     if ($LASTEXITCODE -ne 0) { throw 'LED test compilation failed.' }
+    }
     if ($runtimeFailures.Count) { throw ($runtimeFailures -join [Environment]::NewLine) }
     Write-Host 'Development components tested. No app installation or release artifact produced.'
     return

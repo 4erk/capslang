@@ -3,6 +3,7 @@
 #include "../src/network/language_channel.hpp"
 #include "../src/network/pairing.hpp"
 #include "../src/network/enrollment.hpp"
+#include "../src/network/paired_connection.hpp"
 #include <bcrypt.h>
 #include <thread>
 #include <cstdio>
@@ -318,6 +319,82 @@ void Pairing(const Identity& server, const Identity& client, const Identity& str
     SecureZeroMemory(decoded.secret.data(), decoded.secret.size());
     if (!code.empty()) SecureZeroMemory(code.data(), code.size());
 }
+void ApplicationModes(const Identity& serverIdentity, const Identity& clientIdentity) {
+    struct Case { bool temporary; ApplicationMode mode; int mutation; bool accept; DWORD error; };
+    const Case cases[]{
+        {false,ApplicationMode::Session,0,true,0},
+        {false,ApplicationMode::ResumeEnrollment,0,true,0},
+        {true,ApplicationMode::Enroll,0,true,0},
+        {true,ApplicationMode::Session,0,false,ERROR_ACCESS_DENIED},
+        {true,ApplicationMode::ResumeEnrollment,0,false,ERROR_ACCESS_DENIED},
+        {false,ApplicationMode::Enroll,0,false,ERROR_ACCESS_DENIED},
+        {false,ApplicationMode::Session,1,false,ERROR_INVALID_DATA},
+        {false,ApplicationMode::Session,2,false,ERROR_INVALID_DATA},
+        {false,ApplicationMode::Session,3,false,ERROR_INVALID_DATA},
+        {false,ApplicationMode::Session,4,true,0},
+        {false,ApplicationMode::Session,5,false,ERROR_TIMEOUT},
+    };
+    for (const auto& item : cases) {
+        Socket listener(socket(AF_INET,SOCK_STREAM,IPPROTO_TCP));
+        sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int size = sizeof(address);
+        if (listener.value == INVALID_SOCKET || bind(listener.value,reinterpret_cast<sockaddr*>(&address),size) ||
+            listen(listener.value,1) || getsockname(listener.value,reinterpret_cast<sockaddr*>(&address),&size)) {
+            Check(false,"application-mode loopback listener"); continue;
+        }
+        Socket client(socket(AF_INET,SOCK_STREAM,IPPROTO_TCP));
+        if (connect(client.value,reinterpret_cast<sockaddr*>(&address),size)) { Check(false,"mode test connect"); continue; }
+        Socket accepted(accept(listener.value,nullptr,nullptr));
+        if (accepted.value == INVALID_SOCKET) { Check(false,"mode test accept"); continue; }
+        bool serverOk = false, clientOk = false; DWORD serverError = 0, clientError = 0;
+        ApplicationMode selected = ApplicationMode::Session;
+        HANDLE modeFinished = CreateEventW(nullptr,TRUE,FALSE,nullptr);
+        if (!modeFinished) { Check(false,"mode deadline barrier"); continue; }
+        std::thread worker([&] {
+            TlsChannel tls(accepted.value);
+            if (tls.Handshake(serverIdentity,true,item.temporary ? Pin{} : clientIdentity.Fingerprint(),item.temporary))
+                serverOk = AcceptApplicationMode(tls,selected,serverError);
+            else serverError = tls.Error();
+            SetEvent(modeFinished);
+            shutdown(accepted.value,SD_BOTH);
+        });
+        TlsChannel tls(client.value);
+        if (tls.Handshake(clientIdentity,false,serverIdentity.Fingerprint())) {
+            if (!item.mutation) clientOk = SelectApplicationMode(tls,item.mode,clientError);
+            else {
+                std::vector<BYTE> frame{'C','L','A','P',1,static_cast<BYTE>(item.mode),0,0};
+                if (item.mutation == 1) frame[0] ^= 1;
+                if (item.mutation == 2) frame[6] = 1;
+                if (item.mutation == 3) frame.push_back(42); // Premature next payload must not be discarded.
+                if (item.mutation == 5) frame.pop_back();
+                bool sent = item.mutation == 4 ? tls.Send(frame.data(),3) && tls.Send(frame.data()+3,frame.size()-3)
+                                               : tls.Send(frame.data(),frame.size());
+                std::vector<BYTE> reply;
+                // Keep the incomplete client's socket open until the SERVER
+                // deadline fires; a simultaneous client close is a different
+                // (connection-aborted) failure, not the deadline under test.
+                if (item.mutation == 5) WaitForSingleObject(modeFinished,2500);
+                clientOk = sent && tls.Receive(reply,1500) && reply == frame;
+            }
+        }
+        shutdown(client.value,SD_BOTH); worker.join();
+        CloseHandle(modeFinished);
+        if (serverOk != item.accept || clientOk != item.accept || serverError != item.error)
+            std::printf("Mode mismatch: temporary=%d mode=%u mutation=%d expected=%d server=%d client=%d error=%lu expected_error=%lu\n",
+                item.temporary,static_cast<unsigned>(item.mode),item.mutation,item.accept,serverOk,clientOk,serverError,item.error);
+        Check(serverOk == item.accept && clientOk == item.accept && serverError == item.error,
+              "application-mode TLS role, framing and deadline enforced");
+        Check(item.accept ? selected == item.mode : static_cast<BYTE>(selected) == 0,
+              "failed mode negotiation exposes no selected handler");
+    }
+    DWORD error = 0;
+    TlsChannel disconnected(INVALID_SOCKET);
+    Check(!SelectApplicationMode(disconnected,ApplicationMode::Session,error) && error == ERROR_ACCESS_DENIED,
+          "application mode cannot bypass server pinning");
+    PairRecord wrongOwner{clientIdentity.Fingerprint(),serverIdentity.Fingerprint(),"test-listener",42519,true};
+    Check(!ServePairedConnection(disconnected,serverIdentity,wrongOwner,{},nullptr,error) && error == ERROR_INVALID_PARAMETER,
+          "pair for another local identity rejected before connecting");
+}
 void Enrollment(const Identity& serverIdentity, const Identity& clientIdentity) {
     Scratch scratch;
     Check(!scratch.directory.empty(), "enrollment isolated storage directory");
@@ -341,28 +418,24 @@ void Enrollment(const Identity& serverIdentity, const Identity& clientIdentity) 
         DWORD serverError = 0;
         std::thread worker([&] {
             TlsChannel tls(accepted.value);
-            const bool handshake = tls.Handshake(serverIdentity, true, resume ? clientIdentity.Fingerprint() : Pin{}, !resume);
-            serverTrusted = tls.Paired();
-            if (!handshake) { serverError = tls.Error(); return; }
             if (resume) {
                 PairRecord stored;
                 serverOk = LoadPair(scratch.File(L"listener-pair"), serverIdentity.Fingerprint(), stored, serverError) &&
-                    ResumeEnrollmentServer(tls, stored, serverError);
+                    ServePairedConnection(tls, serverIdentity, stored, {}, nullptr, serverError);
             } else {
                 unsigned polls = 0;
-                serverOk = EnrollServer(tls, gate, scratch.File(L"listener-pair"), [&](const Pin& peer) {
+                serverOk = ServeInvitationConnection(tls, serverIdentity, gate, scratch.File(L"listener-pair"), [&](const Pin& peer) {
                     gotApproval = EqualPin(peer, clientIdentity.Fingerprint());
                     if (!gotApproval) return PairApproval::Deny;
                     if (++polls < 3) return PairApproval::Pending;
                     return approve ? PairApproval::Allow : PairApproval::Deny;
                 }, serverError);
             }
+            serverTrusted = tls.Paired();
+            shutdown(accepted.value, SD_BOTH);
         });
         TlsChannel tls(client.value);
-        bool clientOk = tls.Handshake(clientIdentity, false, serverIdentity.Fingerprint());
-        if (clientOk) clientOk = resume
-            ? ResumeEnrollmentClient(tls, clientIdentity, invitation, scratch.File(L"connector-pair"), error)
-            : EnrollClient(tls, clientIdentity, invitation, scratch.File(L"connector-pair"), error);
+        const bool clientOk = OpenInvitationConnection(tls, clientIdentity, invitation, scratch.File(L"connector-pair"), resume, error);
         shutdown(client.value, SD_BOTH); worker.join();
         SecureZeroMemory(invitation.secret.data(), invitation.secret.size());
         SecureZeroMemory(code.data(), code.size());
@@ -431,6 +504,7 @@ int wmain(int argc, wchar_t** argv) {
         Check(!notPaired.Receive(noMessage) && notPaired.Error() == ERROR_ACCESS_DENIED,
               "language protocol refuses unestablished TLS channel");
         Pairing(server, client, stranger);
+        ApplicationModes(server, client);
         Enrollment(server, client);
     }
     Persistence();

@@ -65,7 +65,7 @@ class LanListener {
 public:
     bool Open(std::uint16_t port, DWORD& error);
     Socket Accept(HANDLE cancel, DWORD timeoutMs, DWORD& error);
-    void Close() { socket_.Reset(); }
+    void Close() { socket_.Reset(); port_ = 0; }
     std::uint16_t Port() const { return port_; }
 private:
     Socket socket_;

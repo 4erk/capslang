@@ -10,6 +10,7 @@
 #include <vector>
 #ifdef CAPSLANG_ENGINE_INTEGRATION
 #include "../src/runtime/engine.hpp"
+#include "../src/runtime/focus_target.hpp"
 #include "../src/runtime/engine_host.hpp"
 #include "../src/runtime/engine_client.hpp"
 #include "../src/network/session.hpp"
@@ -590,6 +591,23 @@ void EngineTests(const std::wstring& desktop) {
         Check(false, "engine foreign fixtures ready"); return;
     }
     capturedWindow = first.data->window;
+    {
+        ShowWindow(first.data->window,SW_SHOWNOACTIVATE); // Private, inactive desktop only.
+        FocusTarget selector;MwbSnapshot snapshot;snapshot.responsive=true;
+        auto& evidence=snapshot.evidence;evidence.applications=1;evidence.helpers=1;
+        evidence.supportedBinary=true;evidence.dots=1;evidence.helperPid=second.data->pid;
+        evidence.dotWindow=second.data->window;evidence.settings.known=true;
+        evidence.settings.maintenanceInput=false;evidence.settings.hideCursor=true;
+        Check(selector.Select(first.Target(),snapshot).focus==first.data->window,"real user target remembered before MWB routing");
+        const auto behind=selector.Select(second.Target(),snapshot);
+        Check(behind.focus==first.data->window,"MWB dot focus selects previous text window without click");
+        LayoutApplier apply;
+        Check(apply.Request(behind,FindLayout(kRussian)).posted && PumpUntil([&]{return TargetLanguage(first.Target())==kRussian;}),"background text window receives language while MWB owns foreground");
+        Check(TargetLanguage(second.Target())==kEnglish,"service dot is not a layout target");
+        snapshot.responsive=false;
+        Check(selector.Select(second.Target(),snapshot).focus==second.data->window,"stale MWB evidence cannot redirect a target");
+        Check(first.Reset(0),"background focus regression fixture reset");
+    }
     Engine engine({false, CaptureFixture}); // No hardware writes in this suite.
     Check(!engine.SetTarget(Language::Russian) && !engine.RestartHook(), "stopped engine rejects work");
     Check(engine.Start(), "real engine worker starts on private desktop");
@@ -646,6 +664,7 @@ void EngineTests(const std::wstring& desktop) {
             PrintFixtureWait(first.data->tid, second.data->pid);
         }
         Check(applied, "production engine confirms absolute language in foreign process");
+        Check(!engine.Status().layoutError, "confirmed layout has no stale application error");
     }
     Check(engine.Status().userRevision == 0, "own application never echoed as manual activity");
     Check(first.Reset(3), "fixture delays old RU but applies newer EN immediately");

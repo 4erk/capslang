@@ -1,4 +1,7 @@
 #include "../src/app/broker.hpp"
+#include "../src/app/firewall.hpp"
+#include "../src/app/install_store.hpp"
+#include "../src/app/installer.hpp"
 #include "../src/app/paths.hpp"
 #include "../src/app/tasks.hpp"
 #include "../src/platform/private_store.hpp"
@@ -129,6 +132,65 @@ void Codec() {
     DWORD error = 0;
     Check(!ProtectedExecutable(ExecutablePath(), error) && error == ERROR_ACCESS_DENIED,
           "unprotected developer executable cannot become privileged engine");
+}
+void InstallationRecords() {
+    install::Record record;
+    record.sid = ipc::Endpoint::Current().sid;
+    record.after[0] = 1;
+    std::vector<BYTE> bytes;
+    install::Record decoded;
+    Check(install::Encode(record, bytes) && install::Decode(bytes, decoded) &&
+              decoded.sid == record.sid && decoded.after == record.after,
+          "durable installation journal roundtrip");
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        auto corrupt = bytes;
+        corrupt[i] ^= 1;
+        Check(!install::Decode(corrupt, decoded), "every single-byte journal corruption refused");
+    }
+    for (size_t length : {size_t(0), size_t(4), bytes.size() - 1}) {
+        auto shortRecord = bytes;
+        shortRecord.resize(length);
+        Check(!install::Decode(shortRecord, decoded), "partial durable journal refused");
+    }
+    auto extra = bytes;
+    extra.push_back(0);
+    Check(!install::Decode(extra, decoded), "journal trailing data refused");
+    record.phase = static_cast<install::Phase>(900);
+    Check(!install::Encode(record, bytes), "unknown installation phase refused");
+    record.phase = install::Phase::Prepared;
+    record.hadExecutable = true;
+    Check(!install::Encode(record, bytes), "rollback requires prior executable digest");
+    record.before[0] = 2;
+    record.engineXml = L"owned fixture";
+    Check(!install::Encode(record, bytes), "task snapshot requires ACL");
+    record.engineSecurity = L"owned ACL";
+    Check(install::Encode(record, bytes) && install::Decode(bytes, decoded) &&
+              decoded.before == record.before,
+          "previous executable and owned task metadata preserved");
+    if (!ProcessElevation(GetCurrentProcessId()).elevated)
+        Check(AdminInstall(AdminAction::Install) == ERROR_ACCESS_DENIED,
+              "ordinary code cannot enter administrative installation");
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    Check(SUCCEEDED(initialized), "COM initialized for in-memory firewall definition");
+    if (SUCCEEDED(initialized)) {
+        DWORD error = 0;
+        const auto executable = InstalledExecutable(error);
+        INetFwRule *rule = nullptr;
+        const auto hr = BuildFirewallRule(executable, record.sid, &rule);
+        Check(SUCCEEDED(hr) && rule, "firewall definition built without registration");
+        if (rule) {
+            Check(MatchesFirewallRule(rule, executable, record.sid),
+                  "firewall exact executable, TCP port, LocalSubnet, all profiles, no edge "
+                  "traversal");
+            BSTR all = SysAllocString(L"*");
+            rule->put_RemoteAddresses(all);
+            SysFreeString(all);
+            Check(!MatchesFirewallRule(rule, executable, record.sid),
+                  "broad remote-address rule cannot be adopted");
+            rule->Release();
+        }
+        CoUninitialize();
+    }
 }
 void TaskDefinitions() {
     const auto endpoint = ipc::Endpoint::Current();
@@ -336,6 +398,7 @@ void Lifecycle() {
 } // namespace
 int main() {
     Codec();
+    InstallationRecords();
     TaskDefinitions();
     Lifecycle();
     std::printf("Application: %u checks, %u failures; model engine, isolated files, no "

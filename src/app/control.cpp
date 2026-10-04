@@ -175,7 +175,7 @@ std::string StatusJson(const PublicStatus &s, std::uint64_t now) {
 }
 std::wstring StatusText(const PublicStatus &s, std::uint64_t now) {
     std::wostringstream out;
-    out << L"CapsLang 1.1.0 — сборка разработки\r\n";
+    out << L"CapsLang 1.1.0-rc.1 — предварительный выпуск\r\n";
     if (!s.sampled || now < s.sampled || now - s.sampled > 3000)
         out << L"Состояние устарело или ещё не получено.\r\n";
     if (s.engineError)

@@ -1,4 +1,5 @@
 #include "tasks.hpp"
+#include "../runtime/local_ipc.hpp"
 #include "paths.hpp"
 #include <sddl.h>
 
@@ -361,6 +362,15 @@ HRESULT Tasks::Start(TaskRole role, const std::wstring &executable, const std::w
         return HRESULT_FROM_WIN32(ERROR_SERVICE_DISABLED);
     Com<IRunningTask> running;
     Variant empty;
+    if (!Administrator()) {
+        const auto current = ipc::Endpoint::Current();
+        if (current.error || current.sid != sid || current.session != session)
+            return E_ACCESSDENIED;
+        // The fixed task's read/execute ACL permits normal startup without
+        // another UAC prompt. RunEx's explicit session override requires an
+        // administrator, so ordinary callers use their current session.
+        return task->Run(empty.value, running.Out());
+    }
     return task->RunEx(empty.value, kUseSessionId | kUserSid, static_cast<LONG>(session), Bstr(sid),
                        running.Out());
 }

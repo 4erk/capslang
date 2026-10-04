@@ -1,6 +1,7 @@
 #include "engine.hpp"
 #include "led_worker.hpp"
 #include "recipient_input.hpp"
+#include "focus_target.hpp"
 #include "../core/keyboard.hpp"
 #include <objbase.h>
 #include <wtsapi32.h>
@@ -37,6 +38,7 @@ struct Engine::Impl {
     EngineStatus status;
     core::LayoutState layout;
     LayoutTarget target;
+    FocusTarget focusTarget;
     std::unique_ptr<LayoutApplier> applier;
     LedWorker leds;
     MwbMonitor mwb;
@@ -236,7 +238,7 @@ struct Engine::Impl {
         struct TickGuard { bool& active; ~TickGuard() { active = false; } } guard{ticking};
         const auto now = GetTickCount64();
         if (locked) { UpdateLeds(); Publish(); return; }
-        const auto focus = options.capture();
+        const auto focus = focusTarget.Select(options.capture(), mwb.Status());
         if (!TargetStillValid(focus)) {
             if (target.focus) { target = {}; layout.FocusChanged(now); }
             layout.Observe(core::Language::Unknown, layout.Generation(), now);
@@ -266,6 +268,11 @@ struct Engine::Impl {
             } else layout.Request(actual, core::Origin::Manual, now);
         }
         layout.Observe(actual, layout.Generation(), now);
+        // A previous inaccessible foreground (for example MWB's SYSTEM
+        // helper) must not leave a stale error after actual application is
+        // confirmed in the newly focused user window.
+        if (layout.State() == core::ApplyState::Applied && actual == layout.Target())
+            Error(&EngineStatus::layoutError, ERROR_SUCCESS);
         if (layout.Due(now)) {
             const auto generation = layout.Generation();
             const auto request = applier->Request(target, FindLayout(static_cast<LANGID>(layout.Target())));

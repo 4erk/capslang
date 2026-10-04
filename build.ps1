@@ -18,6 +18,7 @@ if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $NetworkTestsOnly, $App
     throw 'Choose only one development build mode.'
 }
 if ($NetworkTestsOnly) { $RuntimeTestsOnly = $true }
+$Release = -not ($ProbeOnly -or $IntegrationOnly -or $RuntimeTestsOnly -or $AppDevOnly -or $SaverGuardOnly -or $RecipientProbeOnly)
 # Some WSL hosts inherit PATHEXT=.CPL. PowerShell then fails to wait for .exe
 # invocations or set LASTEXITCODE. Repair only this build process, and restore
 # the caller's environment even on failure or an early return.
@@ -84,19 +85,23 @@ if (-not (Test-Path -LiteralPath $windres)) {
     throw "Resource compiler not found after extraction: $windres"
 }
 
-if ($AppDevOnly) {
+if ($AppDevOnly -or $Release) {
+    if ($Release -and -not $SkipTests) {
+        & $PSCommandPath -RuntimeTestsOnly
+    }
     $appDir = Join-Path $buildDir 'app-dev'
     New-Item -ItemType Directory -Force -Path $appDir | Out-Null
     $flags = @('-std=c++17', '-O2', '-DNDEBUG', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00',
         '-static', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-Wl,--no-insert-timestamp')
     $appSources = @('app\control.cpp','app\broker.cpp','app\paths.cpp','app\tasks.cpp',
+        'app\install_store.cpp','app\installer.cpp','app\migration.cpp','app\firewall.cpp',
         'runtime\local_ipc.cpp','runtime\engine_client.cpp','platform\windows_support.cpp',
         'network\runtime.cpp','network\application_mode.cpp','network\paired_connection.cpp',
         'network\enrollment.cpp','network\session.cpp','network\lan.cpp',
         'network\pairing.cpp','network\tls.cpp','platform\private_store.cpp') |
         ForEach-Object { Join-Path $projectRoot ('src\' + $_) }
     $libs = @('-lole32','-loleaut32','-ltaskschd','-luuid','-luser32','-ladvapi32','-lsetupapi','-lshell32','-lcomctl32',
-        '-lws2_32','-liphlpapi','-lsecur32','-lcrypt32','-lncrypt','-lbcrypt')
+        '-lws2_32','-liphlpapi','-lsecur32','-lcrypt32','-lncrypt','-lbcrypt','-lversion')
     if (-not $SkipTests) {
         $appTest = Join-Path $appDir 'windows_app_tests.exe'
         & $compiler @flags (Join-Path $projectRoot 'tests\windows_app_tests.cpp') @appSources '-o' $appTest @libs
@@ -122,12 +127,19 @@ if ($AppDevOnly) {
     if ($LASTEXITCODE -ne 0) { throw 'App resource compilation failed.' }
     $appExe = Join-Path $appDir 'CapsLang.exe'
     & $compiler @flags '-s' '-municode' '-mwindows' (Join-Path $projectRoot 'src\app\main.cpp') `
+        (Join-Path $projectRoot 'src\app\saver.cpp') `
         (Join-Path $projectRoot 'src\app\window.cpp') @appSources `
         (Join-Path $projectRoot 'src\runtime\engine_host.cpp') (Join-Path $projectRoot 'src\runtime\engine.cpp') `
         (Join-Path $projectRoot 'src\runtime\mwb_monitor.cpp') (Join-Path $projectRoot 'src\runtime\led_worker.cpp') `
         (Join-Path $projectRoot 'src\platform\mwb.cpp') $resource '-o' $appExe @libs '-lwtsapi32' '-lversion' '-lwintrust'
     if ($LASTEXITCODE -ne 0) { throw 'Development application compilation failed.' }
-    Write-Host "Built development app (NOT installed or release-ready): $appExe"
+    if ($Release) {
+        $releaseExe = Join-Path $distDir 'CapsLang.exe'
+        Copy-Item -LiteralPath $appExe -Destination $releaseExe -Force
+        $digest = (Get-FileHash -LiteralPath $releaseExe -Algorithm SHA256).Hash.ToLowerInvariant()
+        [IO.File]::WriteAllText((Join-Path $distDir 'SHA256SUMS.txt'), "$digest  CapsLang.exe`n", [Text.UTF8Encoding]::new($false))
+        Write-Host "Built release candidate: $releaseExe"
+    } else { Write-Host "Built application for local testing: $appExe" }
     Write-Host "SHA256: $((Get-FileHash -LiteralPath $appExe -Algorithm SHA256).Hash)"
     return
 }

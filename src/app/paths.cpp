@@ -89,6 +89,9 @@ bool ProtectedObject(const std::wstring &path, bool directory, DWORD &error) {
     return ok;
 }
 } // namespace
+bool ProtectedPath(const std::wstring &path, bool directory, DWORD &error) {
+    return ProtectedObject(path, directory, error);
+}
 std::wstring ExecutablePath() {
     wchar_t path[32768]{};
     const DWORD size = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));

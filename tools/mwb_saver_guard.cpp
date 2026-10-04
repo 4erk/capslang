@@ -47,6 +47,9 @@ bool MwbRunning(bool& running) {
     return true;
 }
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+#ifdef CAPSLANG_SAVER_EMBEDDED
+    if(message==WM_APP+30){SetEvent(stopEvent);return 0;}
+#endif
     if (message == WM_QUERYENDSESSION) return TRUE;
     if (message == WM_ENDSESSION && wp) SetEvent(stopEvent);
     return DefWindowProcW(window, message, wp, lp);
@@ -86,7 +89,11 @@ int Run(bool testStop, bool testCrash) {
     wchar_t executable[32768]{};
     if (!GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable))) return 6;
     wchar_t args[33000]{};
+#ifdef CAPSLANG_SAVER_EMBEDDED
+    swprintf_s(args, L"\"%s\" --saver-watch %llu %llu %llu %llu", executable,
+#else
     swprintf_s(args, L"\"%s\" --watch %llu %llu %llu %llu", executable,
+#endif
         reinterpret_cast<unsigned long long>(parent.h), reinterpret_cast<unsigned long long>(mapping.h),
         reinterpret_cast<unsigned long long>(instance.h), reinterpret_cast<unsigned long long>(done.h));
     SIZE_T bytes = 0;
@@ -159,10 +166,25 @@ int Run(bool testStop, bool testCrash) {
     return static_cast<int>(exitCode);
 }
 }
+#ifdef CAPSLANG_SAVER_EMBEDDED
+int CapsLangSaverMain() {
+#else
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+#endif
     int count = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &count);
     if (!argv) return 1;
+#ifdef CAPSLANG_SAVER_EMBEDDED
+    // Fixed aliases only. The privileged engine/installer never calls this.
+    std::wstring translated;
+    if(count>=2){
+        if(wcscmp(argv[1],L"--saver-watch")==0)translated=L"--watch";
+        else if(wcscmp(argv[1],L"--saver-status")==0)translated=L"--status";
+        else if(wcscmp(argv[1],L"--saver-stop")==0)translated=L"--stop";
+        else if(wcscmp(argv[1],L"--saver-guard")==0 && count==2)count=1;
+        if(!translated.empty())argv[1]=translated.data();
+    }
+#endif
     int result = 0;
     if (count == 6 && wcscmp(argv[1], L"--watch") == 0) {
         HANDLE handles[4]{};

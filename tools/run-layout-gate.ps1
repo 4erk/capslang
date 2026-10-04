@@ -6,7 +6,8 @@ param(
     [ValidateRange(1,30)][int]$Seconds=3,
     [ValidateRange(1,4)][int]$Rounds=1,
     [switch]$ConfirmActiveDesktop,
-    [switch]$AddressTarget
+    [switch]$AddressTarget,
+    [ValidateSet('Baseline','ActiveManager','DirectProfile','ActiveDirectProfile')][string]$Technique='Baseline'
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -16,7 +17,7 @@ if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
     throw 'Run in the ordinary interactive user context; elevated TSF is not this gate.'
 }
 if ($Mode -ne 'Observe' -and !$ConfirmActiveDesktop) { throw 'Active desktop opt-in required.' }
-if ($Mode -eq 'Observe' -and ($ConfirmActiveDesktop -or $AddressTarget)) { throw 'Invalid observe options.' }
+if ($Mode -eq 'Observe' -and ($ConfirmActiveDesktop -or $AddressTarget -or $Technique -ne 'Baseline')) { throw 'Invalid observe options.' }
 if (Test-Path -LiteralPath $Report) { throw 'Report already exists: preserve prior evidence.' }
 $probe=(Resolve-Path -LiteralPath $Executable).Path
 $installed=Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'CapsLang\CapsLang.exe'
@@ -62,6 +63,8 @@ try {
     $arguments="--seconds $Seconds"
     if ($Mode -ne 'Observe') { $arguments+=" --apply $Mode --confirm-active-desktop" }
     if ($AddressTarget) { $arguments+=' --address-target' }
+    if ($Technique -in @('ActiveManager','ActiveDirectProfile')) { $arguments+=' --activate-manager' }
+    if ($Technique -in @('DirectProfile','ActiveDirectProfile')) { $arguments+=' --direct-profile' }
     for ($round=1;$round -le $Rounds;$round++) {
         $lines.Add(([pscustomobject]@{event='round';number=$round}|ConvertTo-Json -Compress))
         $result=Invoke-Bounded $probe $arguments (($Seconds+10)*1000)

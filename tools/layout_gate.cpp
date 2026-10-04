@@ -22,6 +22,7 @@ class Profiles final : public ITfInputProcessorProfileActivationSink {
     ULONG references = 1;
     unsigned notifications = 0;
     LANGID notifiedLanguage = 0;
+    bool activated = false;
 
     Profiles() {
         threadHr = CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER,
@@ -39,6 +40,7 @@ class Profiles final : public ITfInputProcessorProfileActivationSink {
     }
     ~Profiles() {
         if (source && cookie != TF_INVALID_COOKIE) source->UnadviseSink(cookie);
+        if (threads && activated) threads->Deactivate();
         if (source) source->Release();
         if (manager) manager->Release();
         if (profiles) profiles->Release();
@@ -78,15 +80,22 @@ class Profiles final : public ITfInputProcessorProfileActivationSink {
                     notifications, notifiedLanguage);
         std::fflush(stdout);
     }
-    void Apply(LANGID language, bool addressed) {
+    void Apply(LANGID language, bool addressed, bool activateManager, bool directProfile) {
         const auto target = CaptureLayoutTarget();
         const auto layout = FindLayout(language);
         const auto started = GetTickCount64();
-        HRESULT change = profiles ? profiles->ChangeCurrentLanguage(language) : profilesHr;
+        HRESULT threadActivate = E_UNEXPECTED;
+        if (activateManager && threads) {
+            TfClientId client = 0;
+            threadActivate = threads->Activate(&client);
+            activated = threadActivate == S_OK;
+        }
+        HRESULT change = directProfile ? S_FALSE : profiles ? profiles->ChangeCurrentLanguage(language) : profilesHr;
         HRESULT activate = E_UNEXPECTED;
-        if (change == S_OK && manager && layout)
+        if ((directProfile || change == S_OK) && manager && layout)
             activate = manager->ActivateProfile(TF_PROFILETYPE_KEYBOARDLAYOUT, language,
-                                               CLSID_NULL, GUID_NULL, layout, kForSession);
+                                               CLSID_NULL, GUID_NULL, layout,
+                                               kForSession | (directProfile ? 4U : 0U));
         bool posted = false;
         DWORD postError = 0;
         if (addressed) {
@@ -98,9 +107,11 @@ class Profiles final : public ITfInputProcessorProfileActivationSink {
             }
         }
         std::printf("{\"event\":\"request\",\"language\":%u,\"change_hr\":%ld,"
+                    "\"thread_activate_hr\":%ld,\"direct_profile\":%s,"
                     "\"activate_hr\":%ld,\"addressed\":%s,\"posted\":%s,\"post_error\":%lu,"
                     "\"duration_ms\":%llu,\"application_confirmed\":false}\n",
-                    language, change, activate, addressed ? "true" : "false", posted ? "true" : "false",
+                    language, change, threadActivate, directProfile ? "true" : "false",
+                    activate, addressed ? "true" : "false", posted ? "true" : "false",
                     postError, static_cast<unsigned long long>(GetTickCount64()-started));
         std::fflush(stdout);
     }
@@ -111,6 +122,7 @@ int wmain(int count, wchar_t** args) {
     unsigned seconds = 3;
     LANGID apply = 0;
     bool confirm = false, addressed = false;
+    bool activateManager = false, directProfile = false;
     for (int i=1; i<count; ++i) {
         if (wcscmp(args[i], L"--seconds") == 0 && i+1<count) {
             wchar_t* end = nullptr;
@@ -124,9 +136,11 @@ int wmain(int count, wchar_t** args) {
             else return ERROR_INVALID_PARAMETER;
         } else if (wcscmp(args[i], L"--confirm-active-desktop") == 0) confirm=true;
         else if (wcscmp(args[i], L"--address-target") == 0) addressed=true;
+        else if (wcscmp(args[i], L"--activate-manager") == 0) activateManager=true;
+        else if (wcscmp(args[i], L"--direct-profile") == 0) directProfile=true;
         else return ERROR_INVALID_PARAMETER;
     }
-    if ((apply && !confirm) || (!apply && (confirm || addressed))) return ERROR_INVALID_PARAMETER;
+    if ((apply && !confirm) || (!apply && (confirm || addressed || activateManager || directProfile))) return ERROR_INVALID_PARAMETER;
     if (apply && !FindLayout(apply)) return ERROR_NOT_SUPPORTED;
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(com)) return 2;
@@ -142,7 +156,7 @@ int wmain(int count, wchar_t** args) {
                     profiles.threadHr, profiles.profilesHr, profiles.managerHr, profiles.sinkHr);
         const auto started = GetTickCount64();
         profiles.Sample(started);
-        if (apply) profiles.Apply(apply,addressed);
+        if (apply) profiles.Apply(apply,addressed,activateManager,directProfile);
         while (GetTickCount64()-started < seconds*1000ULL) {
             MSG message{};
             while (PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {

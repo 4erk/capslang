@@ -5,13 +5,14 @@ param(
     [switch]$ProbeOnly,
     [switch]$IntegrationOnly,
     [switch]$RuntimeTestsOnly,
-    [switch]$SaverGuardOnly
+    [switch]$SaverGuardOnly,
+    [switch]$RecipientProbeOnly
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $SaverGuardOnly) | Where-Object { $_ }).Count -gt 1) {
+if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $SaverGuardOnly, $RecipientProbeOnly) | Where-Object { $_ }).Count -gt 1) {
     throw 'Choose only one development build mode.'
 }
 # Some WSL hosts inherit PATHEXT=.CPL. PowerShell then fails to wait for .exe
@@ -35,7 +36,9 @@ $downloadUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$toolVe
 $expectedSha256 = 'b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35'
 
 if ($Clean) {
-    if ($SaverGuardOnly) {
+    if ($RecipientProbeOnly) {
+        Remove-Item -LiteralPath (Join-Path $buildDir 'recipient-probe') -Recurse -Force -ErrorAction SilentlyContinue
+    } elseif ($SaverGuardOnly) {
         Remove-Item -LiteralPath (Join-Path $buildDir 'saver-guard') -Recurse -Force -ErrorAction SilentlyContinue
     } elseif ($IntegrationOnly -or $RuntimeTestsOnly) {
         Remove-Item -LiteralPath $integrationDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -74,6 +77,21 @@ if (-not (Test-Path -LiteralPath $compiler)) {
 }
 if (-not (Test-Path -LiteralPath $windres)) {
     throw "Resource compiler not found after extraction: $windres"
+}
+
+if ($RecipientProbeOnly) {
+    $recipientDir = Join-Path $buildDir 'recipient-probe'
+    New-Item -ItemType Directory -Force -Path $recipientDir | Out-Null
+    $recipientExe = Join-Path $recipientDir 'mwb_recipient_probe.exe'
+    & $compiler '-std=c++17' '-O2' '-DNDEBUG' '-D_WIN32_WINNT=0x0A00' '-DWINVER=0x0A00' `
+        '-static' '-s' '-Wall' '-Wextra' '-Wpedantic' '-Werror' '-Wl,--no-insert-timestamp' `
+        (Join-Path $projectRoot 'tools\mwb_recipient_probe.cpp') `
+        (Join-Path $projectRoot 'src\platform\mwb.cpp') (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
+        '-o' $recipientExe '-lole32' '-luuid' '-luser32' '-ladvapi32' '-lsetupapi' `
+        '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32'
+    if ($LASTEXITCODE -ne 0) { throw 'Recipient observer compilation failed.' }
+    Write-Host "Built $recipientExe. Not run: requires coordinated physical input on both devices."
+    return
 }
 
 if ($SaverGuardOnly) {
@@ -128,12 +146,17 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags (Join-Path $projectRoot 'tests\sync_tests.cpp') '-o' $sync
     if ($LASTEXITCODE -ne 0) { throw 'Sync protocol compilation failed.' }
     Invoke-BoundedTest $sync
+    $reconnect = Join-Path $integrationDir 'reconnect_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\reconnect_tests.cpp') '-o' $reconnect
+    if ($LASTEXITCODE -ne 0) { throw 'Reconnect policy compilation failed.' }
+    Invoke-BoundedTest $reconnect
     $engine = Join-Path $integrationDir 'windows_engine_integration.exe'
     & $compiler @flags '-municode' '-DCAPSLANG_ENGINE_INTEGRATION' `
         (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') $platform `
         (Join-Path $projectRoot 'src\runtime\engine.cpp') (Join-Path $projectRoot 'src\platform\mwb.cpp') `
+        (Join-Path $projectRoot 'src\runtime\engine_host.cpp') `
         (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
-        '-o' $engine @libs '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32'
+        '-o' $engine @libs '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32' '-lbcrypt'
     if ($LASTEXITCODE -ne 0) { throw 'Engine integration compilation failed.' }
     Invoke-BoundedTest $engine
     $ipc = Join-Path $integrationDir 'windows_ipc_tests.exe'

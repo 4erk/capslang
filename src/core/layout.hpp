@@ -26,6 +26,10 @@ public:
         return true;
     }
     void Toggle(std::uint64_t now) { Request(Opposite(target_), Origin::Caps, now); }
+    bool RequestPeer(Language language, std::uint64_t expectedUserRevision, std::uint64_t now) {
+        if (expectedUserRevision != userRevision_) return false;
+        return Request(language, Origin::Peer, now);
+    }
     void FocusChanged(std::uint64_t now) { Request(target_, Origin::Focus, now); }
     void Lock(bool locked, std::uint64_t now) {
         locked_ = locked;

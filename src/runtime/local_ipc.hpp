@@ -5,14 +5,23 @@
 #include <memory>
 
 namespace capslang::ipc {
-constexpr std::uint32_t kMagic = 0x314c5043, kVersion = 1;
-enum class Operation : std::uint32_t { Status = 1, SetLayout = 2, RefreshHook = 3, Stop = 4 };
+constexpr std::uint32_t kMagic = 0x314c5043, kVersion = 2;
+enum class Operation : std::uint32_t {
+    Status = 1, SetLayout = 2, RefreshHook = 3, Stop = 4, SetLayoutIfRevision = 5
+};
+enum StatusFlag : std::uint32_t {
+    Elevated = 1U, HookRegistered = 2U, HookResponsive = 4U, Locked = 8U,
+    LedWritten = 16U, LedPartial = 32U
+};
 #pragma pack(push, 1)
 struct Request {
     std::uint32_t magic = kMagic, version = kVersion;
     Operation operation = Operation::Status;
     std::uint32_t language = 0;
     std::uint64_t id = 0, reserved = 0;
+    // Conditional update binds both the engine incarnation and local intent.
+    // All other operations require zero in both fields.
+    std::uint64_t engineEpoch = 0, expectedRevision = 0;
 };
 struct Response {
     std::uint32_t magic = kMagic, version = kVersion;
@@ -21,9 +30,10 @@ struct Response {
     std::uint32_t hookError = 0, layoutError = 0, ledError = 0;
     std::uint64_t generation = 0, revision = 0, recovery = 0;
     std::uint64_t physicalAge = UINT64_MAX, injectedKeyAge = UINT64_MAX;
+    std::uint64_t engineEpoch = 0;
 };
 #pragma pack(pop)
-static_assert(sizeof(Request) == 32 && sizeof(Response) == 88, "fixed wire ABI");
+static_assert(sizeof(Request) == 48 && sizeof(Response) == 96, "fixed wire ABI v2");
 bool Valid(const Request& request);
 struct Endpoint {
     std::wstring name, sid;

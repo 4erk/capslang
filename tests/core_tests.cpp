@@ -63,6 +63,20 @@ int main() {
     check(layout.Target() == Language::English && layout.Due(1300), "unlock applies latest target");
     for (int i = 0; i < 1000; ++i) layout.Toggle(1400 + i);
     check(layout.Target() == Language::English && layout.UserRevision() == revision + 1000, "rapid toggles preserve parity");
+    const auto sampledRevision = layout.UserRevision();
+    layout.Toggle(2500);
+    const auto afterCaps = layout.Generation();
+    check(!layout.RequestPeer(Language::English, sampledRevision, 2501) &&
+        layout.Target() == Language::Russian && layout.Generation() == afterCaps,
+        "late peer update cannot erase Caps intent after broker snapshot");
+    check(layout.RequestPeer(Language::English, layout.UserRevision(), 2502) &&
+        layout.UserRevision() == sampledRevision + 1, "matching peer revision applies without creating local intent");
+    layout.Request(Language::Russian, Origin::Manual, 2503);
+    check(!layout.RequestPeer(Language::English, sampledRevision + 1, 2504) &&
+        layout.Target() == Language::Russian, "late peer update cannot erase manual language selection");
+    const auto manualRevision = layout.UserRevision();
+    layout.FocusChanged(2505);
+    check(layout.RequestPeer(Language::English, manualRevision, 2506), "focus-only changes do not invalidate user intent revision");
     std::printf("Core tests: %u checks, %u failures.\n", checks, failed);
     return failed ? 1 : 0;
 }

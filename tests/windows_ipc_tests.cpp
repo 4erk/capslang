@@ -93,6 +93,12 @@ int main() {
     Check(Malformed(endpoint, bad), "truncated language attack refused");
     bad = request; bad.reserved = 1;
     Check(Malformed(endpoint, bad), "unknown flags refused");
+    bad = request; bad.engineEpoch = 1;
+    Check(Malformed(endpoint, bad), "status refuses an unexpected engine epoch");
+    bad = request; bad.expectedRevision = 1;
+    Check(Malformed(endpoint, bad), "status refuses an unexpected intent revision");
+    bad = request; bad.operation = Operation::SetLayoutIfRevision; bad.language = kEnglish;
+    Check(Malformed(endpoint, bad), "conditional update requires nonzero engine epoch");
     Check(BadLength(endpoint, 8), "short frame disconnected");
     Check(BadLength(endpoint, 64), "oversized frame disconnected");
     Check(calls == before, "malformed requests never invoke handler");

@@ -10,6 +10,7 @@
 #include <vector>
 #ifdef CAPSLANG_ENGINE_INTEGRATION
 #include "../src/runtime/engine.hpp"
+#include "../src/runtime/engine_host.hpp"
 #include "../src/platform/mwb.hpp"
 #include "../src/runtime/local_ipc.hpp"
 #include <atomic>
@@ -647,6 +648,68 @@ void EngineTests(const std::wstring& desktop) {
     engine.Stop();
     Check(GetTickCount64() - stopStart < 2000 && !engine.Status().hookRegistered, "engine orderly shutdown removes hooks");
     Check(!engine.SetTarget(Language::English) && !engine.RestartHook(), "post-stop work rejected");
+    const auto hostEndpoint = ipc::Endpoint::Current(L"host-test-" + std::to_wstring(GetCurrentProcessId()));
+    EngineHost host(hostEndpoint, {false, CaptureFixture});
+    Check(host.Start() && host.Start(), "production IPC engine host starts idempotently");
+    {
+        EngineHost duplicate(hostEndpoint, {false, CaptureFixture});
+        Check(!duplicate.Start() && duplicate.Error() == ERROR_ACCESS_DENIED,
+              "duplicate host is rejected before it can start a second engine");
+    }
+    wchar_t executable[32768]{}; GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
+    ipc::Request request{}; request.id = 1;
+    ipc::Response response{}; DWORD error = 0;
+    auto call = [&] {
+        ++request.id;
+        return ipc::Call(hostEndpoint, executable, false, request, response, error) && !response.error;
+    };
+    Check(call() && (response.flags & ipc::HookRegistered) && (response.flags & ipc::HookResponsive),
+          "production host returns real hook health via protected IPC");
+    request.operation = ipc::Operation::SetLayout; request.language = kEnglish;
+    Check(call(), "host accepts exact EN request, not a synthetic key sequence");
+    request.operation = ipc::Operation::Status; request.language = 0;
+    Check(PumpUntil([&] {
+        return call() && response.target == kEnglish && response.actual == kEnglish &&
+            response.apply == static_cast<DWORD>(ApplyState::Applied) && TargetLanguage(second.Target()) == kEnglish;
+    }), "IPC-to-production-engine-to-foreign-window EN is actually confirmed");
+    request.operation = ipc::Operation::SetLayout; request.language = kRussian;
+    Check(call(), "host accepts exact RU request");
+    request.operation = ipc::Operation::Status; request.language = 0;
+    Check(PumpUntil([&] {
+        return call() && response.target == kRussian && response.actual == kRussian &&
+            response.apply == static_cast<DWORD>(ApplyState::Applied) && TargetLanguage(second.Target()) == kRussian;
+    }), "IPC-to-production-engine-to-foreign-window RU is actually confirmed");
+    Check(response.revision == 0 && response.physicalAge == UINT64_MAX,
+          "IPC requests do not masquerade as physical input or local user changes");
+    const auto epoch = response.engineEpoch;
+    Check(epoch != 0, "host publishes a random nonzero incarnation");
+    request.operation = ipc::Operation::SetLayoutIfRevision; request.language = kEnglish;
+    request.expectedRevision = 1; request.engineEpoch = epoch;
+    Check(call(), "conditional peer request is queued without claiming it was applied");
+    request.operation = ipc::Operation::Status; request.language = 0;
+    request.expectedRevision = 0; request.engineEpoch = 0;
+    PumpUntil([] { return false; }, 150);
+    Check(call() && response.target == kRussian && TargetLanguage(second.Target()) == kRussian,
+          "worker refuses peer request with a stale local intent snapshot");
+    request.operation = ipc::Operation::SetLayoutIfRevision; request.language = kEnglish;
+    request.engineEpoch = epoch;
+    Check(call(), "conditional peer request with matching revision is queued");
+    request.operation = ipc::Operation::Status; request.language = 0;
+    request.engineEpoch = 0;
+    Check(PumpUntil([&] { return call() && response.actual == kEnglish && response.target == kEnglish; }),
+          "matching conditional update reaches actual target");
+    request.operation = ipc::Operation::Stop;
+    Check(call() && WaitForSingleObject(host.ShutdownEvent(), 0) == WAIT_OBJECT_0,
+          "stop request signals the owner without joining IPC from its own callback");
+    host.Stop(); host.Stop();
+    request.operation = ipc::Operation::Status;
+    Check(!call(), "stopped host endpoint is gone");
+    Check(host.Start(), "host restarts cleanly after complete shutdown");
+    Check(call() && response.engineEpoch && response.engineEpoch != epoch, "restart changes the engine incarnation");
+    request.operation = ipc::Operation::SetLayoutIfRevision; request.language = kEnglish; request.engineEpoch = epoch;
+    Check(!call() && response.error == ERROR_REVISION_MISMATCH,
+          "old broker request rejected after restart even when revision numbers match");
+    host.Stop();
     capturedWindow = nullptr;
 }
 #endif

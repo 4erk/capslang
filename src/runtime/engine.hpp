@@ -29,6 +29,9 @@ public:
     bool Start();
     void Stop();
     bool SetTarget(core::Language language);
+    // Queue an absolute peer update conditional on the local revision observed
+    // by the broker. The worker compares it immediately before applying.
+    bool SetTargetIfRevision(core::Language language, std::uint64_t expectedUserRevision);
     bool RestartHook();
     EngineStatus Status() const;
 private:

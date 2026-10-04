@@ -12,6 +12,7 @@ namespace capslang {
 namespace {
 constexpr UINT kToggle = WM_APP + 21, kSet = WM_APP + 22, kManual = WM_APP + 23;
 constexpr UINT kStop = WM_APP + 24, kRehook = WM_APP + 25;
+constexpr UINT kConditionalSet = WM_APP + 26;
 constexpr ULONG_PTR kLegacyInput = 0x434150534c414e47ULL, kLegacyProbe = 0x4341505350524f42ULL;
 constexpr wchar_t kEngineClass[] = L"CapsLang.Engine.1.1";
 bool Down(WPARAM message) { return message == WM_KEYDOWN || message == WM_SYSKEYDOWN; }
@@ -243,6 +244,13 @@ struct Engine::Impl {
         case kToggle:
             self->manualUntil = 0; self->ownApplyUntil = now + 1500;
             self->layout.Toggle(now); self->Tick(); return 0;
+        case kConditionalSet:
+            // A manual shortcut has reached the user thread but Windows may
+            // not have changed its HKL yet. Do not erase this pending intent.
+            if (self->manualUntil) return 0;
+            if (!self->layout.RequestPeer(static_cast<core::Language>(wp), static_cast<std::uint64_t>(lp), now)) return 0;
+            self->manualUntil = 0; self->ownApplyUntil = now + 1500;
+            self->Tick(); return 0;
         case kSet:
             self->manualUntil = 0; self->ownApplyUntil = now + 1500;
             self->layout.Request(static_cast<core::Language>(wp), core::Origin::Peer, now);
@@ -370,6 +378,12 @@ bool Engine::SetTarget(core::Language language) {
 bool Engine::RestartHook() {
     const HWND window = impl_->window.load();
     return window && !impl_->stopping && PostMessageW(window, kRehook, 0, 0) != FALSE;
+}
+bool Engine::SetTargetIfRevision(core::Language language, std::uint64_t expectedUserRevision) {
+    static_assert(sizeof(LPARAM) == sizeof(std::uint64_t), "CapsLang 1.1 requires x64");
+    const HWND window = impl_->window.load();
+    return window && !impl_->stopping && core::Supported(language) &&
+        PostMessageW(window, kConditionalSet, static_cast<WPARAM>(language), static_cast<LPARAM>(expectedUserRevision));
 }
 EngineStatus Engine::Status() const { std::lock_guard<std::mutex> guard(impl_->statusMutex); return impl_->status; }
 } // namespace capslang

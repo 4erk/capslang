@@ -81,8 +81,12 @@ bool Transfer(HANDLE pipe, void* buffer, DWORD size, bool write, HANDLE stop, DW
 }
 bool Valid(const Request& request) {
     if (request.magic != kMagic || request.version != kVersion || !request.id || request.reserved) return false;
+    if (request.operation == Operation::SetLayoutIfRevision) {
+        if (!request.engineEpoch) return false;
+    } else if (request.engineEpoch || request.expectedRevision) return false;
     switch (request.operation) {
-    case Operation::SetLayout: return IsSupportedLanguage(static_cast<LANGID>(request.language)) && request.language <= 0xffff;
+    case Operation::SetLayout: case Operation::SetLayoutIfRevision:
+        return IsSupportedLanguage(static_cast<LANGID>(request.language)) && request.language <= 0xffff;
     case Operation::Status: case Operation::RefreshHook: case Operation::Stop: return request.language == 0;
     default: return false;
     }

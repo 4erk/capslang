@@ -19,6 +19,7 @@ struct EngineStatus {
     DWORD profileError = ERROR_NOT_READY;
     std::uint64_t profileGeneration = 0;
     bool profileConfirmed = false, systemEnabled = false;
+    bool targetThreadProfile = false;
 };
 struct EngineOptions {
     // Test dependency supplied by code, not by CLI or IPC. Default uses the
@@ -28,6 +29,9 @@ struct EngineOptions {
     // Never invoked from a hook. Portable/test engines do not use SYSTEM.
     std::function<DWORD(LANGID)> systemApply{};
     bool requireDesktopProfile = false;
+    // Selected by trusted startup code from this EXE's embedded bundle.
+    // Empty retains the legacy diagnostic engine, not an automatic fallback.
+    std::wstring profileModule{};
 };
 
 class Engine {

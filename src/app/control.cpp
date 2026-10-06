@@ -161,6 +161,7 @@ std::string StatusJson(const PublicStatus &s, std::uint64_t now) {
         << ",\"hook_error\":" << e.hookError << ",\"layout_error\":" << e.layoutError
         << ",\"profile_error\":" << e.profileError
         << ",\"profile_language\":" << e.profileLanguage
+        << ",\"profile_scope\":\"" << ((e.flags & ipc::TargetThreadProfile) ? "target_thread" : "broker_thread") << "\""
         << ",\"profile_generation\":" << e.profileGeneration
         << ",\"generation\":" << e.generation << ",\"revision\":" << e.revision
         << ",\"profile_confirmed\":" << ((e.flags & ipc::ProfileConfirmed) ? "true" : "false")
@@ -178,7 +179,7 @@ std::string StatusJson(const PublicStatus &s, std::uint64_t now) {
 }
 std::wstring StatusText(const PublicStatus &s, std::uint64_t now) {
     std::wostringstream out;
-    out << L"CapsLang 1.1.0-rc.1 — предварительный выпуск\r\n";
+    out << L"CapsLang 1.1.0-dev.2 — разработка, не релиз\r\n";
     if (!s.sampled || now < s.sampled || now - s.sampled > 3000)
         out << L"Состояние устарело или ещё не получено.\r\n";
     if (s.engineError)
@@ -198,7 +199,9 @@ std::wstring StatusText(const PublicStatus &s, std::uint64_t now) {
             << L"Применение: " << ApplyText(e.apply) << L"; ошибка: " << e.layoutError << L"\r\n"
             << L"MWB: " << ((e.mwbFlags & ipc::MwbRunning) ? L"запущен" : L"не запущен")
             << L"\r\n"
-            << L"Системный профиль: " << LanguageText(static_cast<std::uint32_t>(e.profileLanguage))
+            << ((e.flags & ipc::TargetThreadProfile) ? L"Профиль рабочего потока: " :
+                L"Профиль фонового процесса (не системный индикатор): ")
+            << LanguageText(static_cast<std::uint32_t>(e.profileLanguage))
             << L"; подтверждение текущего запроса: " << ((e.flags & ipc::ProfileConfirmed) ? L"да" : L"нет")
             << L"; ошибка: " << e.profileError << L"\r\n"
             << L"Доступ к SYSTEM-окнам: " << ((e.flags & ipc::SystemEnabled) ? L"включён" : L"нет") << L"\r\n";

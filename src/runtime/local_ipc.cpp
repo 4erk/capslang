@@ -20,6 +20,12 @@ bool TokenMatches(HANDLE token, const Endpoint& endpoint) {
     return GetTokenInformation(token, TokenSessionId, &session, sizeof(session), &bytes) &&
         session == endpoint.session && Sid(token) == endpoint.sid;
 }
+bool ProcessMatches(HANDLE process, const ProcessIdentity& expected) {
+    if (!expected.CompleteOrEmpty()) return false;
+    if (!expected.id) return true;
+    ProcessIdentity actual;
+    return IdentifyProcess(process, actual) && actual.id == expected.id && actual.created == expected.created;
+}
 bool ClientMatches(HANDLE pipe, const Endpoint& endpoint) {
     if (!ImpersonateNamedPipeClient(pipe)) return false;
     HANDLE token = nullptr;
@@ -32,18 +38,19 @@ bool ClientMatches(HANDLE pipe, const Endpoint& endpoint) {
     if (token) CloseHandle(token);
     // Never call the handler while impersonating even the allowed user.
     if (!RevertToSelf()) std::terminate();
-    if (match && !endpoint.clientImage.empty()) {
+    if (match && (!endpoint.clientImage.empty() || endpoint.clientProcess.id)) {
         ULONG pid = 0;
         match = GetNamedPipeClientProcessId(pipe, &pid) != FALSE;
         HANDLE process = match ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
         wchar_t path[32768]{}; DWORD length = ARRAYSIZE(path);
-        match = process && QueryFullProcessImageNameW(process, 0, path, &length) &&
-            _wcsicmp(path, endpoint.clientImage.c_str()) == 0;
+        match = process && ProcessMatches(process, endpoint.clientProcess) &&
+            (endpoint.clientImage.empty() || (QueryFullProcessImageNameW(process, 0, path, &length) &&
+            _wcsicmp(path, endpoint.clientImage.c_str()) == 0));
         if (process) CloseHandle(process);
     }
     return match;
 }
-bool ServerMatches(HANDLE pipe, const Endpoint& endpoint, const std::wstring& path, bool high) {
+bool ServerMatches(HANDLE pipe, const Endpoint& endpoint, const std::wstring& path, bool high, ProcessIdentity& identity) {
     ULONG pid = 0;
     if (path.empty() || !GetNamedPipeServerProcessId(pipe, &pid)) return false;
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -54,7 +61,8 @@ bool ServerMatches(HANDLE pipe, const Endpoint& endpoint, const std::wstring& pa
     TOKEN_ELEVATION elevation{};
     auto server = endpoint;
     if (!endpoint.serverSid.empty()) server.sid = endpoint.serverSid;
-    const bool valid = QueryFullProcessImageNameW(process, 0, actual, &length) &&
+    const bool valid = ProcessMatches(process, endpoint.serverProcess) && IdentifyProcess(process, identity) &&
+        QueryFullProcessImageNameW(process, 0, actual, &length) &&
         _wcsicmp(actual, path.c_str()) == 0 &&
         OpenProcessToken(process, TOKEN_QUERY, &token) && TokenMatches(token, server) &&
         GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &bytes) &&
@@ -93,6 +101,15 @@ bool Transfer(HANDLE pipe, void* buffer, DWORD size, bool write, HANDLE stop, DW
     if (success) error = 0;
     return success;
 }
+}
+bool IdentifyProcess(HANDLE process, ProcessIdentity& identity) {
+    identity = {};
+    FILETIME created{}, exited{}, kernel{}, user{};
+    const DWORD pid = GetProcessId(process);
+    if (!pid || !GetProcessTimes(process, &created, &exited, &kernel, &user)) return false;
+    const auto stamp = (std::uint64_t(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    if (!stamp) return false;
+    identity = {pid, stamp}; return true;
 }
 bool Valid(const Request& request) {
     if (request.magic != kMagic || request.version != kVersion || !request.id) return false;
@@ -192,6 +209,7 @@ bool MessageServer::Start() {
     auto& self = *impl_;
     if (self.thread) return self.listening;
     if (self.endpoint.error || self.endpoint.name.empty() || !self.handler ||
+        !self.endpoint.clientProcess.CompleteOrEmpty() || !self.endpoint.serverProcess.CompleteOrEmpty() ||
         !self.requestBytes || self.requestBytes > 8192 || !self.responseBytes || self.responseBytes > 8192) {
         self.error = ERROR_INVALID_PARAMETER; return false;
     }
@@ -211,9 +229,12 @@ void MessageServer::Stop() {
 }
 DWORD MessageServer::Error() const { return impl_->error; }
 bool Exchange(const Endpoint& endpoint, const std::wstring& path, bool high,
-              const void* request, DWORD requestBytes, void* response, DWORD responseBytes, DWORD& error) {
+              const void* request, DWORD requestBytes, void* response, DWORD responseBytes, DWORD& error,
+              ProcessIdentity* authenticatedServer) {
+    if (authenticatedServer) *authenticatedServer = {};
     if (endpoint.error || endpoint.name.empty() || !request || !response || !requestBytes || requestBytes > 8192 ||
-        !responseBytes || responseBytes > 8192) { error = ERROR_INVALID_PARAMETER; return false; }
+        !responseBytes || responseBytes > 8192 || !endpoint.clientProcess.CompleteOrEmpty() ||
+        !endpoint.serverProcess.CompleteOrEmpty()) { error = ERROR_INVALID_PARAMETER; return false; }
     HANDLE pipe = CreateFileW(endpoint.name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
         FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
     if (pipe == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY && WaitNamedPipeW(endpoint.name.c_str(), 500))
@@ -221,8 +242,9 @@ bool Exchange(const Endpoint& endpoint, const std::wstring& path, bool high,
             FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) { error = GetLastError(); return false; }
     bool ok = false;
+    ProcessIdentity serverIdentity;
     DWORD mode = PIPE_READMODE_MESSAGE;
-    if (!ServerMatches(pipe, endpoint, path, high)) error = ERROR_ACCESS_DENIED;
+    if (!ServerMatches(pipe, endpoint, path, high, serverIdentity)) error = ERROR_ACCESS_DENIED;
     else if (!SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr)) error = GetLastError();
     else {
         std::vector<BYTE> outgoing(static_cast<const BYTE*>(request),static_cast<const BYTE*>(request)+requestBytes), incoming(responseBytes);
@@ -234,7 +256,9 @@ bool Exchange(const Endpoint& endpoint, const std::wstring& path, bool high,
         }
         SecureZeroMemory(outgoing.data(),outgoing.size()); SecureZeroMemory(incoming.data(),incoming.size());
     }
-    CloseHandle(pipe); return ok;
+    CloseHandle(pipe);
+    if (ok && authenticatedServer) *authenticatedServer = serverIdentity;
+    return ok;
 }
 Server::Server(Endpoint endpoint, Handler handler)
     : transport_(std::move(endpoint),sizeof(Request),sizeof(Response),[handler=std::move(handler)](const void* input, void* output) {

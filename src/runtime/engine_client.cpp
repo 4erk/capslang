@@ -48,14 +48,14 @@ bool EngineClient::MakeState(const ipc::Response& response, std::uint64_t activi
     if (response.magic != ipc::kMagic || response.version != ipc::kVersion || response.error ||
         !response.engineEpoch || response.target > UINT16_MAX || response.actual > UINT16_MAX ||
         !core::Supported(static_cast<core::Language>(response.target)) ||
-        response.apply > static_cast<std::uint32_t>(core::ApplyState::Locked) || (response.flags & ~63U) ||
+        response.apply > static_cast<std::uint32_t>(core::ApplyState::Locked) || (response.flags & ~127U) ||
         (response.mwbFlags & ~3U)) return false;
     sync::LocalState value;
     value.snapshot = {response.engineEpoch, response.revision, activitySerial,
         static_cast<core::Language>(response.target), activity, mwb};
     value.actual = static_cast<core::Language>(response.actual);
     value.apply = static_cast<core::ApplyState>(response.apply);
-    if ((response.flags & ipc::SystemEnabled) && value.apply == core::ApplyState::Applied &&
+    if ((response.flags & (ipc::SystemEnabled | ipc::TargetThreadProfile)) && value.apply == core::ApplyState::Applied &&
         (!(response.flags & ipc::ProfileConfirmed) || response.profileError ||
          response.profileLanguage != response.target || response.profileGeneration != response.generation))
         value.apply = core::ApplyState::Pending;

@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "profile_attachment.hpp"
 #include "../platform/mwb_presence.hpp"
 #include "../core/keyboard.hpp"
 #include <objbase.h>
@@ -29,6 +30,10 @@ bool AnyDeliveredKeyHeld() {
     for (int key = 1; key < 256; ++key) if (GetAsyncKeyState(key) & 0x8000) return true;
     return false;
 }
+std::uint64_t SequenceStamp() {
+    LARGE_INTEGER value{}; QueryPerformanceCounter(&value);
+    return static_cast<std::uint64_t>(value.QuadPart);
+}
 }
 
 struct Engine::Impl {
@@ -38,6 +43,9 @@ struct Engine::Impl {
     core::LayoutState layout;
     LayoutTarget target;
     std::unique_ptr<LayoutApplier> applier;
+    std::unique_ptr<ProfileAttachment> profileAttachment;
+    profile_channel::IntentOrder intentOrder;
+    ULONGLONG nextProfileAttach = 0, profileAttachedAt = 0;
     DWORD session = 0, mwbError = ERROR_NOT_READY;
     bool mwbRunning = false;
     ULONGLONG nextMwbSample = 0, lastUserChange = 0;
@@ -79,6 +87,7 @@ struct Engine::Impl {
             profileGeneration == layout.Generation() && !profileError &&
             profileLanguage == static_cast<LANGID>(layout.Target());
         status.systemEnabled = static_cast<bool>(options.systemApply);
+        status.targetThreadProfile = !options.profileModule.empty();
         status.generation = layout.Generation(); status.userRevision = layout.UserRevision();
         status.locked = locked; status.hookRegistered = installed.load();
         status.hookError = installError.load();
@@ -117,16 +126,16 @@ struct Engine::Impl {
             const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
             const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             const bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
-            if ((data.vkCode == VK_SPACE && win) ||
+            if (self->options.profileModule.empty() && ((data.vkCode == VK_SPACE && win) ||
                 ((data.vkCode == VK_LSHIFT || data.vkCode == VK_RSHIFT) && alt) ||
-                ((data.vkCode == VK_LMENU || data.vkCode == VK_RMENU) && shift))
+                ((data.vkCode == VK_LMENU || data.vkCode == VK_RMENU) && shift)))
                 PostMessageW(owner, kManual, 0, 0);
         }
         if (data.vkCode != VK_CAPITAL) return next;
         const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         const auto decision = self->keys.Caps(Down(message) ? core::Edge::Down : core::Edge::Up,
                                               shift, false, false, data.time);
-        if (decision.toggle) PostMessageW(owner, kToggle, 0, 0);
+        if (decision.toggle) PostMessageW(owner, kToggle, 0, static_cast<LPARAM>(SequenceStamp()));
         return decision.suppress ? 1 : next;
     }
     static LRESULT CALLBACK RawRelease(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
@@ -218,6 +227,66 @@ struct Engine::Impl {
         self.installed = false; self.hookThread = 0; hookOwner = nullptr;
         return 0;
     }
+    void ModuleTick(ULONGLONG now) {
+        if (locked) {
+            profileAttachment.reset(); profileSampled = 0; profileError = ERROR_NOT_READY;
+            Publish(); return;
+        }
+        const auto focus = options.capture();
+        if (!TargetStillValid(focus)) {
+            profileAttachment.reset(); target = {}; profileSampled = 0;
+            observed = core::Language::Unknown; profileError = ERROR_INVALID_WINDOW_HANDLE;
+            layout.Observe(core::Language::Unknown, layout.Generation(), now);
+            Error(&EngineStatus::layoutError, profileError); Publish(); return;
+        }
+        const bool changed = focus.focus != target.focus || focus.threadId != target.threadId || focus.processId != target.processId;
+        if (changed) {
+            if (focus.threadId != target.threadId || focus.processId != target.processId) profileAttachment.reset();
+            target = focus; intentOrder.Boundary(SequenceStamp());
+            layout.FocusChanged(now); nextProfileAttach = 0;
+            profileSampled = 0;
+        }
+        if (!profileAttachment && now >= nextProfileAttach) {
+            nextProfileAttach = now + 1000;
+            auto attached = std::make_unique<ProfileAttachment>(target.processId, target.threadId);
+            if (attached->Start(options.profileModule)) {
+                profileAttachment = std::move(attached); profileAttachedAt = now;
+                intentOrder.Boundary(SequenceStamp());
+            } else profileError = attached->Error();
+        }
+        observed = static_cast<core::Language>(TargetLanguage(target));
+        if (profileAttachment) {
+            const auto sample = profileAttachment->Take();
+            profileSampled = sample.sampled;
+            profileError = sample.error;
+            profileLanguage = static_cast<LANGID>(sample.report.profile);
+            profileGeneration = sample.report.confirmedGeneration;
+            if (!changed && !sample.error) {
+                for (std::size_t i = 0; i < sample.count; ++i) {
+                    const auto& event = sample.events[i];
+                    if (intentOrder.Accept(event) && event.language != static_cast<LANGID>(layout.Target()))
+                        layout.Request(static_cast<core::Language>(event.language), core::Origin::Manual, now);
+                }
+            }
+            const bool confirmed = sample.confirmed && sample.report.confirmedGeneration == layout.Generation() &&
+                sample.report.actual == static_cast<LANGID>(layout.Target()) && observed == layout.Target();
+            layout.Observe(confirmed ? observed : core::Language::Unknown, layout.Generation(), now);
+            if (layout.Due(now)) {
+                const auto generation = layout.Generation();
+                if (!profileAttachment->Request(static_cast<LANGID>(layout.Target()), generation)) profileError = ERROR_RETRY;
+                layout.Sent(generation, now);
+            }
+            // Transport loss is not evidence of manual language selection.
+            // A new binding re-establishes a baseline and retries the desired
+            // state; it never claims a fresh application without a UI read.
+            const auto lastRead = sample.sampled ? sample.sampled : profileAttachedAt;
+            if (sample.error && now - lastRead >= 2000) {
+                profileAttachment.reset(); profileSampled = 0; nextProfileAttach = now + 500;
+            }
+        } else layout.Observe(core::Language::Unknown, layout.Generation(), now);
+        Error(&EngineStatus::layoutError, profileError);
+        Publish();
+    }
     void Tick() {
         // COM/TSF calls may pump this STA's window messages. Nested timers or
         // kSet messages must not recursively enter another TSF activation.
@@ -226,6 +295,7 @@ struct Engine::Impl {
         ticking = true;
         struct TickGuard { bool& active; ~TickGuard() { active = false; } } guard{ticking};
         const auto now = GetTickCount64();
+        if (!options.profileModule.empty()) { ModuleTick(now); return; }
         if (locked) { Publish(); return; }
         const auto focus = options.capture();
         if (!TargetStillValid(focus)) {
@@ -311,6 +381,7 @@ struct Engine::Impl {
         const auto now = GetTickCount64();
         switch (message) {
         case kProfile: case kProfileManual:
+            if (!self->options.profileModule.empty()) return 0;
             if (static_cast<std::uint64_t>(lp) != self->layout.Generation()) return 0;
             if (message == kProfileManual) {
                 const auto language = static_cast<core::Language>(wp & 0xffff);
@@ -327,20 +398,25 @@ struct Engine::Impl {
             self->Tick(); return 0;
         case WM_TIMER: self->Tick(); return 0;
         case kToggle:
+            if (!self->options.profileModule.empty()) self->intentOrder.Boundary(static_cast<std::uint64_t>(lp));
             self->manualUntil = 0; self->ownApplyUntil = now + 1500;
             self->layout.Toggle(now); self->Tick(); return 0;
         case kConditionalSet:
+            if (!self->options.profileModule.empty()) self->Tick();
             // A manual shortcut has reached the user thread but Windows may
             // not have changed its HKL yet. Do not erase this pending intent.
             if (self->manualUntil) return 0;
             if (!self->layout.RequestPeer(static_cast<core::Language>(wp), static_cast<std::uint64_t>(lp), now)) return 0;
+            if (!self->options.profileModule.empty()) self->intentOrder.Boundary(SequenceStamp());
             self->manualUntil = 0; self->ownApplyUntil = now + 1500;
             self->Tick(); return 0;
         case kSet:
+            if (!self->options.profileModule.empty()) self->intentOrder.Boundary(SequenceStamp());
             self->manualUntil = 0; self->ownApplyUntil = now + 1500;
             self->layout.Request(static_cast<core::Language>(wp), core::Origin::Peer, now);
             self->Tick(); return 0;
         case kManual:
+            if (!self->options.profileModule.empty()) return 0;
             self->manualBefore = self->layout.Target(); self->manualUntil = now + 700; return 0;
         case kRehook: self->rehookRequested = true; return 0;
         case kStop: self->stopping = true; SetEvent(self->stopEvent); return 0;
@@ -373,7 +449,7 @@ struct Engine::Impl {
         HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kEngineClass, L"", WS_POPUP, 0, 0, 0, 0,
             nullptr, nullptr, wc.hInstance, &self);
         if (!hwnd) { CoUninitialize(); SetEvent(self.workerReady); return 3; }
-        self.applier = std::make_unique<LayoutApplier>();
+        if (self.options.profileModule.empty()) self.applier = std::make_unique<LayoutApplier>();
         self.window = hwnd;
         const auto rights = ProcessElevation(GetCurrentProcessId());
         { std::lock_guard<std::mutex> guard(self.statusMutex); self.status.elevated = rights.known && rights.elevated; }
@@ -413,6 +489,7 @@ struct Engine::Impl {
         DestroyWindow(hwnd);
         self.Publish();
         self.applier.reset(); // Release TSF on its owning STA before COM shutdown.
+        self.profileAttachment.reset();
         CoUninitialize(); return 0;
     }
 };
@@ -465,6 +542,7 @@ bool Engine::RestartHook() {
     return window && !impl_->stopping && PostMessageW(window, kRehook, 0, 0) != FALSE;
 }
 bool Engine::ProfileReport(LANGID language, std::uint64_t generation, DWORD error, bool manual) {
+    if (!impl_->options.profileModule.empty()) return false;
     const auto window = impl_->window.load();
     const WPARAM value = (static_cast<WPARAM>(error) << 32) | language;
     return window && !impl_->stopping && PostMessageW(window, manual ? kProfileManual : kProfile,

@@ -1,4 +1,5 @@
 #include "installer.hpp"
+#include "profile_assets.hpp"
 #include "../runtime/engine_client.hpp"
 #include "../runtime/system_layout.hpp"
 #include "control.hpp"
@@ -400,6 +401,15 @@ DWORD AdminInstall(AdminAction action) {
     install::Hash copied{};
     if (!install::CopyProtected(source, candidate, copied, error) || copied != record.after)
         return error ? error : ERROR_CRC;
+    // Hash-addressed immutable modules are staged BEFORE stopping the old
+    // installation. Previous EXEs keep referring to their own module hashes;
+    // rollback never overwrites a DLL still loaded in another application.
+    HMODULE bundle = LoadLibraryExW(candidate.c_str(), nullptr,
+        LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    if (!bundle) return GetLastError();
+    const bool staged = StageProfileAssets(bundle, root, error);
+    FreeLibrary(bundle);
+    if (!staged) return error;
     if (!install::SaveRecord(root, record, error))
         return error;
     auto apply = [&]() {

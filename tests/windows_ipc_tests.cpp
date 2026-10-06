@@ -71,6 +71,14 @@ int main() {
         Check(Call(endpoint, path, false, request, response, error) && !response.error &&
             response.target == kEnglish && response.id == request.id, "real request/response with identity validation");
     }
+    ProcessIdentity discovered, expected;
+    Check(IdentifyProcess(GetCurrentProcess(), expected) &&
+        Exchange(endpoint, path, false, &request, sizeof(request), &response, sizeof(response), error, &discovered) &&
+        discovered.id == expected.id && discovered.created == expected.created,
+        "bootstrap returns kernel-authenticated server incarnation, not peer-supplied identity");
+    discovered = expected;
+    Check(!Exchange(endpoint, L"C:\\wrong\\program.exe", false, &request, sizeof(request), &response, sizeof(response), error, &discovered) &&
+        !discovered.id && !discovered.created, "failed authentication cannot leave a reusable server pin");
     const auto before = calls.load();
     Check(!Call(endpoint, L"C:\\wrong\\program.exe", false, request, response, error) && error == ERROR_ACCESS_DENIED,
           "client rejects wrong server executable");
@@ -169,6 +177,45 @@ int main() {
             Check(!Call(endpoint,path,false,request,response,error), "medium same-image client refused at privileged endpoint");
             highOnly.Stop();
         }
+    }
+    {
+        ProcessIdentity own;
+        Check(IdentifyProcess(GetCurrentProcess(), own) && own.id == GetCurrentProcessId() && own.created,
+              "kernel-derived process incarnation captured");
+        ProcessIdentity invalid{1, 1};
+        Check(!IdentifyProcess(nullptr, invalid) && !invalid.id && !invalid.created,
+              "invalid process handle clears identity");
+        auto pinned = endpoint; pinned.clientProcess = pinned.serverProcess = own;
+        Server exact(pinned, handle); Check(exact.Start(), "process-pinned endpoint starts");
+        Check(Call(pinned,path,false,request,response,error), "matching process incarnations accepted on both ends");
+        auto stale = pinned; ++stale.serverProcess.created;
+        auto beforePin = calls.load();
+        Check(!Call(stale,path,false,request,response,error) && error == ERROR_ACCESS_DENIED,
+              "reused server PID with wrong creation stamp rejected before sending");
+        Check(calls == beforePin, "stale server identity cannot reach handler");
+        stale = pinned; stale.serverProcess.id ^= 1;
+        if (!stale.serverProcess.id) stale.serverProcess.id = 2;
+        Check(!Call(stale,path,false,request,response,error) && error == ERROR_ACCESS_DENIED,
+              "different server process refused even with the same image and user");
+        exact.Stop();
+        stale = pinned; ++stale.clientProcess.created;
+        Server wrongCreated(stale, handle); Check(wrongCreated.Start(), "stale-client fixture starts");
+        Check(!Call(endpoint,path,false,request,response,error) && calls == beforePin,
+              "same-user client with stale incarnation refused before handler");
+        wrongCreated.Stop();
+        stale = pinned; stale.clientProcess.id ^= 1;
+        if (!stale.clientProcess.id) stale.clientProcess.id = 2;
+        Server wrongPid(stale, handle); Check(wrongPid.Start(), "wrong-client fixture starts");
+        Check(!Call(endpoint,path,false,request,response,error) && calls == beforePin,
+              "wrong client process refused despite matching SID and session");
+        wrongPid.Stop();
+        stale = pinned; stale.clientProcess.created = 0;
+        Server incomplete(stale, handle);
+        Check(!incomplete.Start() && incomplete.Error() == ERROR_INVALID_PARAMETER,
+              "PID-only client pin is not silently accepted");
+        stale = pinned; stale.serverProcess.id = 0;
+        Check(!Call(stale,path,false,request,response,error) && error == ERROR_INVALID_PARAMETER,
+              "partial server pin is rejected locally");
     }
     {
         MessageServer tooLarge(endpoint,8193,16,[](const void*,void*){});

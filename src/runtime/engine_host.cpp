@@ -77,7 +77,8 @@ ipc::Response EngineHost::Handle(const ipc::Request& request) {
         (status.hookThreadResponsive ? ipc::HookResponsive : 0U) |
         (status.locked ? ipc::Locked : 0U) |
         (status.profileConfirmed ? ipc::ProfileConfirmed : 0U) |
-        (status.systemEnabled ? ipc::SystemEnabled : 0U);
+        (status.systemEnabled ? ipc::SystemEnabled : 0U) |
+        (status.targetThreadProfile ? ipc::TargetThreadProfile : 0U);
     response.hookError = status.hookError;
     response.layoutError = status.layoutError;
     response.profileError = status.profileError;

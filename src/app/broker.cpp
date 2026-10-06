@@ -132,7 +132,6 @@ struct Broker::Impl {
     }
     void Run() {
         std::unique_ptr<DesktopProfile> profile;
-        if (dependencies.profile) profile = std::make_unique<DesktopProfile>();
         network.Start(); // A failed network must not take down local CapsLock.
         while (WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
             if (profile) {
@@ -161,6 +160,8 @@ struct Broker::Impl {
                 next.engine = {};
                 next.engineError = readError ? readError : ERROR_NOT_READY;
             }
+            if (!next.engineError && (next.engine.flags & ipc::TargetThreadProfile)) profile.reset();
+            else if (!next.engineError && dependencies.profile && !profile) profile = std::make_unique<DesktopProfile>();
             if (profile && !next.engineError) profile->Update(next.engine,
                 [&](LANGID language,std::uint64_t generation,DWORD failure,bool manual) {
                     return dependencies.profile(next.engine,language,generation,failure,manual);

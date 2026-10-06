@@ -48,23 +48,28 @@ public:
     }
 };
 
-class Profiles final : public ITfInputProcessorProfileActivationSink {
+class Profiles final : public ITfInputProcessorProfileActivationSink, public ITfLanguageProfileNotifySink {
   public:
     ITfThreadMgr* threads = nullptr;
     ITfInputProcessorProfiles* profiles = nullptr;
     ITfInputProcessorProfileMgr* manager = nullptr;
     ITfSource* source = nullptr;
+    ITfSource* languageSource = nullptr;
     ITfLangBarMgr* bar = nullptr;
     DWORD cookie = TF_INVALID_COOKIE;
+    DWORD languageCookie = TF_INVALID_COOKIE;
     HRESULT threadHr = E_UNEXPECTED, profilesHr = E_UNEXPECTED;
     HRESULT managerHr = E_UNEXPECTED, sinkHr = E_UNEXPECTED;
+    HRESULT languageSinkHr = E_UNEXPECTED, observerActivateHr = S_FALSE;
     ULONG references = 1;
     unsigned notifications = 0;
     LANGID notifiedLanguage = 0;
+    unsigned languageChanging = 0, languageChanged = 0;
+    LANGID changingLanguage = 0;
     bool activated = false;
     ShellLanguageObserver shell;
 
-    Profiles() {
+    explicit Profiles(bool activeObserver = false) {
         CoCreateInstance(CLSID_TF_LangBarMgr, nullptr, CLSCTX_INPROC_SERVER,
                          IID_ITfLangBarMgr, reinterpret_cast<void**>(&bar));
         threadHr = CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER,
@@ -77,14 +82,25 @@ class Profiles final : public ITfInputProcessorProfileActivationSink {
         if (threads && SUCCEEDED(threads->QueryInterface(IID_ITfSource, reinterpret_cast<void**>(&source))))
             sinkHr = source->AdviseSink(IID_ITfInputProcessorProfileActivationSink,
                                        static_cast<ITfInputProcessorProfileActivationSink*>(this), &cookie);
-        // Deliberately do not Activate a TSF text-client thread manager: this is
-        // an observer/controller, not a text editor. Report sink availability.
+        if (profiles && SUCCEEDED(profiles->QueryInterface(IID_ITfSource, reinterpret_cast<void**>(&languageSource))))
+            languageSinkHr = languageSource->AdviseSink(IID_ITfLanguageProfileNotifySink,
+                static_cast<ITfLanguageProfileNotifySink*>(this), &languageCookie);
+        // Isolate this hypothesis from the applier: an active TSF observer
+        // never makes cross-thread layout requests and cannot share the
+        // applier's earlier two-STA deadlock. It does not focus a window.
+        if (activeObserver && threads) {
+            TfClientId client = 0;
+            observerActivateHr = threads->Activate(&client);
+            activated = SUCCEEDED(observerActivateHr);
+        }
     }
     ~Profiles() {
         if (bar) bar->Release();
         if (source && cookie != TF_INVALID_COOKIE) source->UnadviseSink(cookie);
+        if (languageSource && languageCookie != TF_INVALID_COOKIE) languageSource->UnadviseSink(languageCookie);
         if (threads && activated) threads->Deactivate();
         if (source) source->Release();
+        if (languageSource) languageSource->Release();
         if (manager) manager->Release();
         if (profiles) profiles->Release();
         if (threads) threads->Release();
@@ -92,8 +108,11 @@ class Profiles final : public ITfInputProcessorProfileActivationSink {
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
         if (!output) return E_POINTER;
         *output = nullptr;
-        if (iid != IID_IUnknown && iid != IID_ITfInputProcessorProfileActivationSink) return E_NOINTERFACE;
-        *output = static_cast<ITfInputProcessorProfileActivationSink*>(this);
+        if (iid == IID_ITfLanguageProfileNotifySink)
+            *output = static_cast<ITfLanguageProfileNotifySink*>(this);
+        else if (iid == IID_IUnknown || iid == IID_ITfInputProcessorProfileActivationSink)
+            *output = static_cast<ITfInputProcessorProfileActivationSink*>(this);
+        else return E_NOINTERFACE;
         AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
@@ -103,6 +122,13 @@ class Profiles final : public ITfInputProcessorProfileActivationSink {
         if (flags & TF_IPSINK_FLAG_ACTIVE) { ++notifications; notifiedLanguage = language; }
         return S_OK;
     }
+    HRESULT STDMETHODCALLTYPE OnLanguageChange(LANGID language, BOOL* accept) override {
+        if (!accept) return E_POINTER;
+        *accept = TRUE; // Diagnostic must never veto the user's selection.
+        ++languageChanging; changingLanguage = language;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnLanguageChanged() override { ++languageChanged; return S_OK; }
     void Sample(ULONGLONG started) {
         TF_INPUTPROCESSORPROFILE profile{};
         const HRESULT activeHr = manager ? manager->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD, &profile) : managerHr;
@@ -127,12 +153,14 @@ class Profiles final : public ITfInputProcessorProfileActivationSink {
                     "\"foreign_profile_hr\":%ld,\"foreign_profile_thread\":%lu,"
                     "\"foreign_language_hr\":%ld,\"foreign_language\":%u,"
                     "\"shell_observer_error\":%lu,\"shell_notifications\":%u,\"shell_notified_language\":%u,"
+                    "\"language_changing\":%u,\"language_changed\":%u,\"changing_language\":%u,"
                     "\"visual_indicator_verified\":false}\n",
                     static_cast<unsigned long long>(GetTickCount64()-started), activeHr,
                     activeHr == S_OK ? profile.langid : 0, currentHr, current,
                     focus.processId, focus.threadId, TargetLanguage(focus), shellLanguage,
                     notifications, notifiedLanguage, foreignHr, profileThread, foreignLanguageHr, foreignLanguage,
-                    this->shell.error, this->shell.notifications, this->shell.language);
+                    this->shell.error, this->shell.notifications, this->shell.language,
+                    languageChanging, languageChanged, changingLanguage);
         std::fflush(stdout);
     }
     void Apply(LANGID language, bool addressed, bool activateManager, bool directProfile) {
@@ -179,6 +207,7 @@ int wmain(int count, wchar_t** args) {
     LANGID reader = 0;
     bool confirm = false, addressed = false;
     bool activateManager = false, directProfile = false;
+    bool activeObserver = false;
     for (int i=1; i<count; ++i) {
         if (wcscmp(args[i], L"--seconds") == 0 && i+1<count) {
             wchar_t* end = nullptr;
@@ -199,10 +228,12 @@ int wmain(int count, wchar_t** args) {
         else if (wcscmp(args[i], L"--address-target") == 0) addressed=true;
         else if (wcscmp(args[i], L"--activate-manager") == 0) activateManager=true;
         else if (wcscmp(args[i], L"--direct-profile") == 0) directProfile=true;
+        else if (wcscmp(args[i], L"--observe-active-client") == 0) activeObserver=true;
         else return ERROR_INVALID_PARAMETER;
     }
     if ((apply && !confirm) || (!apply && (confirm || addressed || activateManager || directProfile))) return ERROR_INVALID_PARAMETER;
     if (reader && apply) return ERROR_INVALID_PARAMETER;
+    if (activeObserver && (reader || apply)) return ERROR_INVALID_PARAMETER;
     if (apply && seconds > 30) return ERROR_INVALID_PARAMETER;
     if (apply && !FindLayout(apply)) return ERROR_NOT_SUPPORTED;
     // Controlled observer-only experiment: flags=0 changes this diagnostic
@@ -212,15 +243,17 @@ int wmain(int count, wchar_t** args) {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(com)) return 2;
     {
-        Profiles profiles;
+        Profiles profiles(activeObserver);
         const auto elevation = ProcessElevation(GetCurrentProcessId());
         DWORD session = 0; ProcessIdToSessionId(GetCurrentProcessId(), &session);
         std::printf("{\"event\":\"start\",\"read_only\":%s,\"pid\":%lu,\"session\":%lu,"
                     "\"elevation_known\":%s,\"elevated\":%s,\"thread_hr\":%ld,"
-                    "\"profiles_hr\":%ld,\"manager_hr\":%ld,\"sink_hr\":%ld,\"reader_language\":%u}\n",
+                    "\"profiles_hr\":%ld,\"manager_hr\":%ld,\"sink_hr\":%ld,\"reader_language\":%u,"
+                    "\"language_sink_hr\":%ld,\"observer_active\":%s,\"observer_activate_hr\":%ld}\n",
                     apply || reader ? "false" : "true", GetCurrentProcessId(), session,
                     elevation.known ? "true":"false", elevation.elevated ? "true":"false",
-                    profiles.threadHr, profiles.profilesHr, profiles.managerHr, profiles.sinkHr, reader);
+                    profiles.threadHr, profiles.profilesHr, profiles.managerHr, profiles.sinkHr, reader,
+                    profiles.languageSinkHr, activeObserver ? "true" : "false", profiles.observerActivateHr);
         const auto started = GetTickCount64();
         profiles.Sample(started);
         if (apply) profiles.Apply(apply,addressed,activateManager,directProfile);

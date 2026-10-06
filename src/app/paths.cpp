@@ -110,7 +110,21 @@ std::wstring DataDirectory(DWORD &error) {
     return root;
 }
 std::wstring InstalledExecutable(DWORD &error) {
+#ifndef _WIN64
+    // FOLDERID_ProgramFilesX64 is explicitly unsupported in a WOW64 process.
+    // Read the machine-owned 64-bit registry view, never an inherited env var.
+    wchar_t native[32768]{};
+    DWORD bytes = sizeof(native);
+    error = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion",
+        L"ProgramFilesDir", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, native, &bytes);
+    if (error || bytes < 2 * sizeof(wchar_t) || bytes > sizeof(native) || native[bytes / sizeof(wchar_t) - 1]) {
+        if (!error) error = ERROR_INVALID_DATA;
+        return {};
+    }
+    const std::wstring root(native);
+#else
     const auto root = Folder(FOLDERID_ProgramFiles, error);
+#endif
     return root.empty() ? std::wstring{} : root + L"\\CapsLang\\CapsLang.exe";
 }
 bool ProtectedExecutable(const std::wstring &path, DWORD &error) {

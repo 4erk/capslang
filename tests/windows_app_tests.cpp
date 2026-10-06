@@ -3,6 +3,7 @@
 #include "../src/app/install_store.hpp"
 #include "../src/app/installer.hpp"
 #include "../src/app/paths.hpp"
+#include "../src/app/profile_assets.hpp"
 #include "../src/app/tasks.hpp"
 #include "../src/platform/private_store.hpp"
 #include "../src/runtime/system_layout.hpp"
@@ -431,6 +432,23 @@ void Lifecycle() {
 }
 } // namespace
 int main() {
+    for (const WORD machine : {WORD(IMAGE_FILE_MACHINE_AMD64), WORD(IMAGE_FILE_MACHINE_I386)}) {
+        ProfileAsset asset, repeated; DWORD error = 0;
+        Check(ReadProfileAsset(GetModuleHandleW(nullptr), machine, asset, error) && !error && !asset.bytes.empty(),
+            "single EXE contains the exact-architecture production module as data");
+        Check(ReadProfileAsset(GetModuleHandleW(nullptr), machine, repeated, error) && asset.hash == repeated.hash,
+            "module address is deterministic across resource reads");
+        const auto relative = ProfileAssetRelativePath(asset);
+        Check(relative.find(L"modules\\" + install::Hex(asset.hash) + L"\\CapsLangProfile") == 0,
+            "each immutable DLL path is tied to the owning executable's embedded bytes");
+    }
+    {
+        ProfileAsset asset; DWORD error = 0;
+        Check(!ReadProfileAsset(nullptr, IMAGE_FILE_MACHINE_AMD64, asset, error) && error == ERROR_INVALID_PARAMETER,
+            "resource reader refuses an unspecified image");
+        Check(!ReadProfileAsset(GetModuleHandleW(nullptr), IMAGE_FILE_MACHINE_ARM64, asset, error) && error == ERROR_INVALID_PARAMETER,
+            "unsupported module architecture is not silently substituted");
+    }
     Codec();
     InstallationRecords();
     SystemBoundary();

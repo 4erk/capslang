@@ -12,7 +12,7 @@ enum class Operation : std::uint32_t {
 };
 enum StatusFlag : std::uint32_t {
     Elevated = 1U, HookRegistered = 2U, HookResponsive = 4U, Locked = 8U,
-    ProfileConfirmed = 16U, SystemEnabled = 32U
+    ProfileConfirmed = 16U, SystemEnabled = 32U, TargetThreadProfile = 64U
 };
 enum MwbFlag : std::uint32_t { MwbRunning = 1U, RecipientAvailable = 2U };
 #pragma pack(push, 1)
@@ -42,6 +42,14 @@ struct Response {
 #pragma pack(pop)
 static_assert(sizeof(Request) == 48 && sizeof(Response) == 120, "fixed wire ABI v4, v3 sizes retained for installer");
 bool Valid(const Request& request);
+// Optional local-code pin for a particular process incarnation. PID alone is
+// insufficient after exit/reuse. Neither field comes from a peer's claim.
+struct ProcessIdentity {
+    DWORD id = 0;
+    std::uint64_t created = 0;
+    bool CompleteOrEmpty() const { return (id == 0) == (created == 0); }
+};
+bool IdentifyProcess(HANDLE process, ProcessIdentity& identity);
 struct Endpoint {
     std::wstring name, sid;
     DWORD session = 0, error = 0;
@@ -49,6 +57,7 @@ struct Endpoint {
     // sid always identifies the allowed client; serverSid may be SYSTEM.
     std::wstring serverSid, clientImage;
     bool requireClientElevation = false;
+    ProcessIdentity clientProcess{}, serverProcess{};
     static Endpoint Current(const std::wstring& instance = L"1.1");
 };
 // Fixed-size local messages share authentication, limits and cancellation.
@@ -70,7 +79,7 @@ private:
 };
 bool Exchange(const Endpoint& endpoint, const std::wstring& expectedServerPath,
               bool requireElevation, const void* request, DWORD requestBytes,
-              void* response, DWORD responseBytes, DWORD& error);
+              void* response, DWORD responseBytes, DWORD& error, ProcessIdentity* authenticatedServer = nullptr);
 class Server {
 public:
     using Handler = std::function<Response(const Request&)>;

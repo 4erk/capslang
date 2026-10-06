@@ -279,7 +279,7 @@ int RunWindow(Broker &broker, const std::wstring &directory, bool show, HANDLE o
     if (!RegisterClassW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         return static_cast<int>(GetLastError());
     HWND hwnd =
-        CreateWindowExW(0, cls.lpszClassName, L"CapsLang 1.1.0-rc.1",
+        CreateWindowExW(0, cls.lpszClassName, L"CapsLang 1.1.0-dev.2",
                         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT,
                         CW_USEDEFAULT, 800, 715, nullptr, nullptr, cls.hInstance, &window);
     if (!hwnd)

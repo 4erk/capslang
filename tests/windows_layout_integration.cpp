@@ -1,5 +1,6 @@
 // Real Win32 cross-process tests on a private, never-activated desktop.
-// No SendInput, hooks, device writes, foreground changes, or legacy stop IPC.
+// No SendInput, device writes, foreground changes or legacy stop IPC. The
+// separate MESSAGE_PROBE build hooks only its owned disposable fixture thread.
 #include "../src/platform/windows_support.hpp"
 #include <objbase.h>
 #include <sddl.h>
@@ -8,6 +9,16 @@
 #include <functional>
 #include <string>
 #include <vector>
+#ifdef CAPSLANG_PROFILE_ENGINE
+#include "../src/runtime/engine.hpp"
+#include <mutex>
+#endif
+#ifdef CAPSLANG_MESSAGE_PROBE
+#include "layout_message_probe.hpp"
+#include "../src/runtime/profile_host.hpp"
+#include "../src/runtime/profile_attachment.hpp"
+#include <msctf.h>
+#endif
 #ifdef CAPSLANG_ENGINE_INTEGRATION
 #include "../src/runtime/engine.hpp"
 #include "../src/runtime/focus_target.hpp"
@@ -26,6 +37,13 @@ using namespace capslang;
 namespace {
 constexpr UINT kReset = WM_APP + 1;
 constexpr UINT kDestroy = WM_APP + 2;
+#ifdef CAPSLANG_MESSAGE_PROBE
+constexpr UINT kEnableTsf = WM_APP + 4;
+constexpr UINT kQueryTsf = WM_APP + 5;
+constexpr UINT kHostSelectLanguage = WM_APP + 6;
+ITfThreadMgr* g_fixtureTsf = nullptr;
+bool g_fixtureCom = false, g_fixtureActive = false;
+#endif
 struct Shared {
     HWND window;
     DWORD pid, tid;
@@ -34,9 +52,27 @@ struct Shared {
     BOOL lowered, posted, controlPosted;
     volatile LONG handlingLayout;
     ULONGLONG layoutEntered, layoutReturned;
+#ifdef CAPSLANG_MESSAGE_PROBE
+    volatile LONG tsfResult = E_PENDING;
+    volatile LONG managerPresent = -1;
+    volatile LONG managerResult = E_PENDING;
+    BOOL visibleFixture = FALSE;
+#endif
 };
 Shared* g_shared = nullptr;
 HKL g_pending = nullptr;
+#ifdef CAPSLANG_PROFILE_ENGINE
+std::mutex profileTargetMutex;
+LayoutTarget profileTarget;
+LayoutTarget CaptureProfileFixture() {
+    std::lock_guard<std::mutex> guard(profileTargetMutex);
+    return profileTarget;
+}
+void SelectProfileFixture(LayoutTarget target) {
+    std::lock_guard<std::mutex> guard(profileTargetMutex);
+    profileTarget = target;
+}
+#endif
 
 LRESULT CALLBACK FixtureProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
@@ -47,6 +83,57 @@ LRESULT CALLBACK FixtureProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         InterlockedIncrement(&g_shared->resetCount);
         return 0;
     case kDestroy: DestroyWindow(window); return 0;
+#ifdef CAPSLANG_MESSAGE_PROBE
+    case kHostSelectLanguage: {
+        // Host-side change, deliberately outside the observer's own operation.
+        // This tests provenance; it is not called a native-picker simulation.
+        HRESULT result = E_INVALIDARG;
+        if (wp == kEnglish || wp == kRussian) {
+            ITfInputProcessorProfiles* profiles = nullptr;
+            ITfInputProcessorProfileMgr* manager = nullptr;
+            result = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+                IID_ITfInputProcessorProfiles, reinterpret_cast<void**>(&profiles));
+            if (SUCCEEDED(result)) result = profiles->QueryInterface(IID_ITfInputProcessorProfileMgr,
+                reinterpret_cast<void**>(&manager));
+            if (SUCCEEDED(result)) result = profiles->ChangeCurrentLanguage(static_cast<LANGID>(wp));
+            if (SUCCEEDED(result)) result = manager->ActivateProfile(TF_PROFILETYPE_KEYBOARDLAYOUT,
+                static_cast<LANGID>(wp), CLSID_NULL, GUID_NULL, FindLayout(static_cast<LANGID>(wp)), 0);
+            if (SUCCEEDED(result) && !ActivateKeyboardLayout(FindLayout(static_cast<LANGID>(wp)), 0)) result = E_FAIL;
+            if (manager) manager->Release();
+            if (profiles) profiles->Release();
+        }
+        InterlockedExchange(&g_shared->tsfResult, result); return 0;
+    }
+    case kQueryTsf: {
+        using GetManager = HRESULT (WINAPI*)(ITfThreadMgr**);
+        const auto module = GetModuleHandleW(L"msctf.dll");
+        const auto get = module ? reinterpret_cast<GetManager>(GetProcAddress(module, "TF_GetThreadMgr")) : nullptr;
+        ITfThreadMgr* manager = nullptr;
+        const HRESULT result = get ? get(&manager) : S_OK;
+        const LONG present = SUCCEEDED(result) ? (manager ? 1 : 0) : -2;
+        if (manager) manager->Release();
+        InterlockedExchange(&g_shared->managerResult, result);
+        InterlockedExchange(&g_shared->managerPresent, present);
+        return 0;
+    }
+    case kEnableTsf: {
+        if (g_fixtureTsf && g_fixtureActive) {
+            InterlockedExchange(&g_shared->tsfResult, S_OK);
+            return 0;
+        }
+        HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        g_fixtureCom = SUCCEEDED(result);
+        if (SUCCEEDED(result)) result = CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER,
+            IID_ITfThreadMgr, reinterpret_cast<void**>(&g_fixtureTsf));
+        if (SUCCEEDED(result)) {
+            TfClientId client = 0;
+            result = g_fixtureTsf->Activate(&client);
+            g_fixtureActive = SUCCEEDED(result);
+        }
+        InterlockedExchange(&g_shared->tsfResult, result);
+        return 0;
+    }
+#endif
     case WM_INPUTLANGCHANGEREQUEST:
         InterlockedIncrement(&g_shared->requests);
         if (InterlockedCompareExchange(&g_shared->mode, 0, 0) == 1) return 0;
@@ -93,7 +180,7 @@ bool PumpUntil(const std::function<bool()>& done, DWORD timeout = 1200) {
     return done();
 }
 
-#ifdef CAPSLANG_ENGINE_INTEGRATION
+#if defined(CAPSLANG_ENGINE_INTEGRATION) || defined(CAPSLANG_MESSAGE_PROBE)
 // Read only our test fixture's wait chain on failure. Never collect object
 // names, window titles or user input. Lack of debug privilege is reported.
 void PrintFixtureWait(DWORD tid, DWORD otherFixture) {
@@ -169,13 +256,30 @@ int FixtureMain(HANDLE mapping, HANDLE ready, HANDLE stop) {
     wc.lpszClassName = L"CapsLang.TestFixture.PrivateDesktop";
     wc.lpfnWndProc = FixtureProc;
     if (!RegisterClassW(&wc)) return 11;
-    HWND window = CreateWindowW(wc.lpszClassName, L"Test fixture", WS_OVERLAPPED,
-        0, 0, 200, 100, nullptr, nullptr, wc.hInstance, nullptr);
+    bool visible = false;
+#ifdef CAPSLANG_MESSAGE_PROBE
+    visible = g_shared->visibleFixture != FALSE;
+#endif
+    HWND window = CreateWindowW(wc.lpszClassName,
+        visible ? L"CapsLang — тест смены языка (закроется через 3 минуты)" : L"Test fixture",
+        visible ? WS_OVERLAPPEDWINDOW : WS_OVERLAPPED,
+        visible ? CW_USEDEFAULT : 0, visible ? CW_USEDEFAULT : 0,
+        visible ? 680 : 200, visible ? 220 : 100, nullptr, nullptr, wc.hInstance, nullptr);
     if (!window) return 12;
     ActivateKeyboardLayout(FindLayout(kEnglish), 0);
     g_shared->window = window;
     g_shared->pid = GetCurrentProcessId();
     g_shared->tid = GetCurrentThreadId();
+    if (visible) {
+        CreateWindowW(L"STATIC", L"Нажми на это окно. Через индикатор Windows выбери English, затем Русский.\n"
+            L"Текст можно набрать ниже: он не сохраняется и не попадает в отчёт.",
+            WS_CHILD | WS_VISIBLE, 12, 12, 635, 55, window, nullptr, wc.hInstance, nullptr);
+        CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            12, 85, 635, 35, window, nullptr, wc.hInstance, nullptr);
+        // Showing our own test UI is not permission to steal another window's
+        // focus. The user activates it explicitly for the coordinated test.
+        ShowWindow(window, SW_SHOWNOACTIVATE);
+    }
     SetEvent(ready);
     while (WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
         const DWORD wait = MsgWaitForMultipleObjects(1, &stop, FALSE, 100, QS_ALLINPUT);
@@ -187,6 +291,11 @@ int FixtureMain(HANDLE mapping, HANDLE ready, HANDLE stop) {
         }
     }
     if (IsWindow(window)) DestroyWindow(window);
+#ifdef CAPSLANG_MESSAGE_PROBE
+    if (g_fixtureTsf && g_fixtureActive) g_fixtureTsf->Deactivate();
+    if (g_fixtureTsf) g_fixtureTsf->Release();
+    if (g_fixtureCom) CoUninitialize();
+#endif
     UnmapViewOfFile(g_shared);
     CloseHandle(mapping); CloseHandle(ready); CloseHandle(stop);
     return 0;
@@ -384,7 +493,8 @@ struct Fixture {
         if (ready) CloseHandle(ready);
         if (stop) CloseHandle(stop);
     }
-    bool Start(std::wstring desktop, const LayoutTarget* destination = nullptr, DWORD ipcIntegrity = 0) {
+    bool Start(std::wstring desktop, const LayoutTarget* destination = nullptr, DWORD ipcIntegrity = 0,
+               bool visibleFixture = false) {
         const FixtureSecurity security;
         if (!security.descriptor || !security.processDescriptor) { std::printf("Fixture security error=%lu\n", GetLastError()); return false; }
         SECURITY_ATTRIBUTES sa{sizeof(sa), security.descriptor, TRUE};
@@ -395,6 +505,11 @@ struct Fixture {
         data = static_cast<Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
         if (!data) return false;
         *data = {};
+#ifdef CAPSLANG_MESSAGE_PROBE
+        data->visibleFixture = visibleFixture;
+#else
+        (void)visibleFixture;
+#endif
         if (destination) data->window = destination->focus;
         if (ipcIntegrity) {
             data->pid = GetCurrentProcessId();
@@ -477,6 +592,396 @@ void Check(bool ok, const char* name) {
                 static_cast<unsigned long long>(GetTickCount64() - began));
     std::fflush(stdout);
 }
+
+#ifdef CAPSLANG_MESSAGE_PROBE
+void MessageObservationTests(const std::wstring& desktop, bool interactive = false) {
+    // Only a thread of this test's owned child on the private inactive desktop.
+    // There is intentionally no "attach to foreground" or global-hook mode.
+    Fixture fixture;
+    if (!fixture.Start(desktop, nullptr, 0, interactive)) { Check(false, "message probe fixture starts"); return; }
+    const auto managerPresent = [&] {
+        InterlockedExchange(&fixture.data->managerPresent, -1);
+        if (!PostMessageW(fixture.data->window, kQueryTsf, 0, 0) || !PumpUntil([&] {
+            return InterlockedCompareExchange(&fixture.data->managerPresent, 0, 0) != -1;
+        })) return LONG(-3);
+        return InterlockedCompareExchange(&fixture.data->managerPresent, 0, 0);
+    };
+    const LONG hostManagerBefore = managerPresent();
+    const auto managerResult = fixture.data->managerResult;
+    Check(hostManagerBefore >= 0 || (hostManagerBefore == -2 && FAILED(managerResult)),
+        "host TSF lookup returns an explicit result without creating a client");
+    std::printf("Host TSF lookup before initialization: presence=%ld hr=0x%08lx\n",
+        hostManagerBefore, static_cast<unsigned long>(managerResult));
+    wchar_t executable[32768]{}; GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
+    const std::wstring path(executable);
+    const auto dll = path.substr(0, path.find_last_of(L"\\/")) + L"\\layout_message_probe.dll";
+    HMODULE module = LoadLibraryExW(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    Check(module != nullptr, "test observer DLL loads from exact test output directory");
+    if (!module) return;
+    const FixtureSecurity security;
+    SECURITY_ATTRIBUTES sa{sizeof(sa), security.processDescriptor, FALSE};
+    HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0,
+        sizeof(test::LayoutMessageProbe), test::ProbeName(fixture.data->pid).c_str());
+    const DWORD created = GetLastError();
+    auto* data = mapping && created != ERROR_ALREADY_EXISTS ?
+        static_cast<test::LayoutMessageProbe*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(test::LayoutMessageProbe))) : nullptr;
+    Check(data != nullptr, "fresh fixture-only observation page created");
+    if (!data) { if (mapping) CloseHandle(mapping); FreeLibrary(module); return; }
+    *data = {};
+    data->process = fixture.data->pid; data->thread = fixture.data->tid;
+    const auto queuedProc = reinterpret_cast<HOOKPROC>(GetProcAddress(module, "ObserveQueued"));
+    const auto returnedProc = reinterpret_cast<HOOKPROC>(GetProcAddress(module, "ObserveReturned"));
+    HHOOK queuedHook = queuedProc ? SetWindowsHookExW(WH_GETMESSAGE, queuedProc, module, fixture.data->tid) : nullptr;
+    HHOOK returnedHook = returnedProc ? SetWindowsHookExW(WH_CALLWNDPROCRET, returnedProc, module, fixture.data->tid) : nullptr;
+    Check(queuedHook && returnedHook, "both hooks attach only to the owned private fixture thread");
+    if (queuedHook && returnedHook) {
+        PostThreadMessageW(fixture.data->tid, WM_APP + 50, 0, 0);
+        Check(PumpUntil([&] { return data->profileError != E_PENDING; }) &&
+            (hostManagerBefore == 1 ? data->profileError == S_OK : hostManagerBefore == 0 ?
+                data->profileError == HRESULT_FROM_WIN32(ERROR_NOT_READY) :
+                hostManagerBefore == -2 && data->profileError == managerResult),
+            "first subscription respects the host's existing TSF readiness");
+        Check(managerPresent() == hostManagerBefore, "observer does not create a TSF manager in the target");
+        Check(PostMessageW(fixture.data->window, kEnableTsf, 0, 0) && PumpUntil([&] {
+            return fixture.data->tsfResult != E_PENDING;
+        }) && fixture.data->tsfResult == S_OK, "fixture explicitly initializes its own TSF client");
+        InterlockedExchange(&data->profileError, E_PENDING);
+        PostThreadMessageW(fixture.data->tid, WM_APP + 50, 0, 0);
+        const bool initialized = PumpUntil([&] { return data->profileError != E_PENDING; }) && data->profileError == S_OK;
+        Check(initialized,
+            "profile sink binds or retries after the host initializes TSF");
+        std::printf("Probe initial host TSF manager: %ld; final subscription: 0x%08lx\n",
+            hostManagerBefore, static_cast<unsigned long>(data->profileError));
+        if (!initialized) {
+            std::printf("Probe initialization failure: stage=%ld hr=0x%08lx\n",
+                data->initializationStage, static_cast<unsigned long>(data->profileError));
+            PrintFixtureWait(fixture.data->tid, 0);
+        }
+        if (!interactive && initialized) {
+            // Windows can create a manager implicitly even in a plain window.
+            // Exercise the not-ready retry deterministically, without claiming
+            // that this host naturally had a late-initializing TSF client.
+            const auto before = fixture.data->resetCount;
+            Check(PostThreadMessageW(fixture.data->tid, WM_APP + 51, 0, 0) &&
+                PostMessageW(fixture.data->window, kReset, 0, 0) && PumpUntil([&] {
+                    return fixture.data->resetCount != before;
+                }), "observer detaches on its target thread before fault injection");
+            InterlockedExchange(&data->simulateMissingManagerOnce, 1);
+            InterlockedExchange(&data->profileError, E_PENDING);
+            Check(PostThreadMessageW(fixture.data->tid, WM_APP + 50, 0, 0) && PumpUntil([&] {
+                return data->profileError != E_PENDING;
+            }) && data->profileError == HRESULT_FROM_WIN32(ERROR_NOT_READY),
+                "injected missing-manager result is reported, not an observation success");
+            Check(managerPresent() == 1, "failed observer lookup leaves the host's manager intact");
+            InterlockedExchange(&data->profileError, E_PENDING);
+            Check(PostThreadMessageW(fixture.data->tid, WM_APP + 50, 0, 0) && PumpUntil([&] {
+                return data->profileError != E_PENDING;
+            }) && data->profileError == S_OK, "subscription retries successfully after transient lookup failure");
+        }
+    }
+    if (queuedHook && returnedHook && interactive) {
+        PostMessageW(fixture.data->window, kEnableTsf, 0, 0);
+        Check(PumpUntil([&] { return fixture.data->tsfResult != E_PENDING; }) && fixture.data->tsfResult == S_OK,
+            "interactive owned fixture activates TSF");
+        std::printf("{\"event\":\"interactive_ready\",\"seconds\":180,\"observer_only\":true}\n");
+        std::fflush(stdout);
+        const auto began = GetTickCount64();
+        LONG queued = -1, returned = -1, changed = -1, profiles = -1; LANGID actual = 0;
+        while (TargetStillValid(fixture.Target()) && GetTickCount64() - began < 180000) {
+            const LONG nextQueued = InterlockedCompareExchange(&data->queued, 0, 0);
+            const LONG nextReturned = InterlockedCompareExchange(&data->returned, 0, 0);
+            const LANGID nextActual = TargetLanguage(fixture.Target());
+            const LONG nextChanged = InterlockedCompareExchange(&data->changed, 0, 0);
+            const LONG nextProfiles = InterlockedCompareExchange(&data->profileNotifications, 0, 0);
+            if (nextQueued != queued || nextReturned != returned || nextActual != actual ||
+                nextChanged != changed || nextProfiles != profiles) {
+                std::printf("{\"event\":\"message_sample\",\"elapsed_ms\":%llu,\"queued\":%ld,"
+                    "\"requested_language\":%ld,\"returned\":%ld,\"actual\":%u,"
+                    "\"changed\":%ld,\"changed_language\":%ld,\"profile_notifications\":%ld,\"profile_language\":%ld}\n",
+                    static_cast<unsigned long long>(GetTickCount64()-began), nextQueued,
+                    data->queuedLanguage, nextReturned, nextActual, nextChanged, data->changedLanguage,
+                    nextProfiles, data->profileLanguage);
+                std::fflush(stdout);
+                queued = nextQueued; returned = nextReturned; actual = nextActual;
+                changed = nextChanged; profiles = nextProfiles;
+            }
+            PumpUntil([] { return false; }, 50);
+        }
+        std::printf("{\"event\":\"interactive_complete\",\"acceptance_verified\":false}\n");
+    } else if (queuedHook && returnedHook) {
+        const auto target = fixture.Target();
+        const auto ru = FindLayout(kRussian), en = FindLayout(kEnglish);
+        const auto queuedCount = [&] { return InterlockedCompareExchange(&data->queued, 0, 0); };
+        const auto returnedCount = [&] { return InterlockedCompareExchange(&data->returned, 0, 0); };
+        Check(PostMessageW(target.focus, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(ru)) &&
+            PumpUntil([&] { return queuedCount() == 1 && TargetLanguage(target) == kRussian; }),
+            "posted external request is observed and actually applies RU");
+        Check(data->queuedLanguage == kRussian, "posted intent carries absolute RU, not an inferred toggle");
+        Check(data->changed > 0 && data->changedLanguage == kRussian,
+            "target-thread observer sees completed input-language notification");
+        const auto before = returnedCount();
+        DWORD_PTR result = 0;
+        const bool sent = SendMessageTimeoutW(target.focus, WM_INPUTLANGCHANGEREQUEST, 0,
+            reinterpret_cast<LPARAM>(en), SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 500, &result) != 0;
+        Check(sent && PumpUntil([&] { return returnedCount() > before && TargetLanguage(target) == kEnglish; }),
+            "bounded own send applies EN and completes on target thread");
+        Check(queuedCount() == 1 && data->returnedLanguage == kEnglish,
+            "own synchronous request is not reclassified as posted manual intent");
+        Check(fixture.Reset(1), "rejecting message probe fixture ready");
+        Check(PostMessageW(target.focus, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(ru)) &&
+            PumpUntil([&] { return queuedCount() == 2; }) && TargetLanguage(target) == kEnglish,
+            "rejected external intent remains observable but is not application success");
+        Check(fixture.Reset(2), "delayed message probe fixture ready");
+        Check(PostMessageW(target.focus, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(ru)) &&
+            PumpUntil([&] { return queuedCount() == 3; }) && TargetLanguage(target) == kEnglish,
+            "external intent arrives before asynchronous application");
+        Check(PumpUntil([&] { return TargetLanguage(target) == kRussian; }),
+            "delayed external application is verified separately from intent");
+        Check(fixture.Reset(0), "normal message probe fixture restored");
+        const auto prior = queuedCount();
+        {
+            // Directly measure whether our session-wide TSF calls themselves
+            // produce queued request messages on the foreign target.
+            const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            ITfInputProcessorProfiles* profiles = nullptr;
+            ITfInputProcessorProfileMgr* manager = nullptr;
+            const HRESULT made = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+                IID_ITfInputProcessorProfiles, reinterpret_cast<void**>(&profiles));
+            HRESULT changed = E_FAIL, applied = E_FAIL;
+            if (SUCCEEDED(made) && SUCCEEDED(profiles->QueryInterface(IID_ITfInputProcessorProfileMgr,
+                reinterpret_cast<void**>(&manager)))) {
+                changed = profiles->ChangeCurrentLanguage(kRussian);
+                applied = manager->ActivateProfile(TF_PROFILETYPE_KEYBOARDLAYOUT, kRussian,
+                    CLSID_NULL, GUID_NULL, ru, 0x20000000);
+            }
+            if (manager) manager->Release();
+            if (profiles) profiles->Release();
+            if (SUCCEEDED(com)) CoUninitialize();
+            Check(SUCCEEDED(changed) && SUCCEEDED(applied), "TSF-origin observation exercise really executed");
+        }
+        PumpUntil([] { return false; }, 400);
+        Check(queuedCount() == prior, "own TSF calls did not manufacture posted external intent in this fixture");
+        // Match a modern text client's TSF participation, rather than proving
+        // the observer only in a plain Win32 window without a thread manager.
+        InterlockedExchange(&fixture.data->tsfResult, E_PENDING);
+        Check(PostMessageW(target.focus, kEnableTsf, 0, 0) && PumpUntil([&] {
+            return InterlockedCompareExchange(&fixture.data->tsfResult, 0, 0) != E_PENDING;
+        }) && fixture.data->tsfResult == S_OK, "foreign fixture activates its own TSF text client");
+        Check(fixture.Reset(0), "active TSF fixture starts at EN");
+        const auto activeBefore = queuedCount();
+        Check(PostMessageW(target.focus, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(ru)) &&
+            PumpUntil([&] { return queuedCount() == activeBefore + 1 && TargetLanguage(target) == kRussian; }),
+            "posted RU selection remains observable in an active TSF client");
+        Check(SendMessageTimeoutW(target.focus, WM_INPUTLANGCHANGEREQUEST, 0,
+            reinterpret_cast<LPARAM>(en), SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 500, &result) &&
+            TargetLanguage(target) == kEnglish && queuedCount() == activeBefore + 1,
+            "own synchronous EN remains distinct in an active TSF client");
+        // Deterministic deferred own completion: the externally posted EN
+        // choice must survive even though the old RU completes later. The
+        // classifier gets an event for EN, and none for the stale own RU.
+        Check(fixture.Reset(3), "fixture delays only an own RU command");
+        const auto delayedBefore = queuedCount();
+        Check(SendMessageTimeoutW(target.focus, WM_INPUTLANGCHANGEREQUEST, 0,
+            reinterpret_cast<LPARAM>(ru), SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 500, &result) &&
+            TargetLanguage(target) == kEnglish, "own RU is accepted but not yet applied");
+        Check(PostMessageW(target.focus, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(en)) &&
+            PumpUntil([&] { return queuedCount() == delayedBefore + 1; }) && data->queuedLanguage == kEnglish,
+            "explicit EN choice is observed even when HKL did not change");
+        Check(PumpUntil([&] { return TargetLanguage(target) == kRussian; }) &&
+            queuedCount() == delayedBefore + 1 && data->queuedLanguage == kEnglish,
+            "late own RU completion cannot fabricate another explicit choice");
+        const auto externalBefore = InterlockedCompareExchange(&data->externalProfiles, 0, 0);
+        const auto ownBefore = InterlockedCompareExchange(&data->ownProfiles, 0, 0);
+        for (int i = 0; i < 20; ++i) {
+            const LONG language = i % 2 ? kRussian : kEnglish;
+            InterlockedExchange(&data->commandLanguage, language);
+            InterlockedExchange64(&data->commandGeneration, i + 1);
+            InterlockedExchange(&data->commandResult, E_PENDING);
+            Check(PostThreadMessageW(fixture.data->tid, WM_APP + 52, 0, 0) &&
+                PumpUntil([&] { return data->commandResult != E_PENDING; }) && data->commandResult == S_OK &&
+                data->commandProfile == language && data->confirmedGeneration == i + 1 && TargetLanguage(target) == language,
+                "in-thread absolute operation confirms both actual HKL and target-local TSF profile");
+        }
+        PumpUntil([] { return false; }, 400); // Detect any delayed callback echoes too.
+        std::printf("Probe origin counts: own_before=%ld own_after=%ld external_before=%ld external_after=%ld\n",
+            ownBefore, data->ownProfiles, externalBefore, data->externalProfiles);
+        Check(data->ownProfiles > ownBefore && data->externalProfiles == externalBefore,
+            "own in-thread operations do not become external profile changes, including delayed callbacks");
+        const auto apply = [&](LONG language, LONG64 generation) {
+            InterlockedExchange(&data->commandLanguage, language);
+            InterlockedExchange64(&data->commandGeneration, generation);
+            InterlockedExchange(&data->commandResult, E_PENDING);
+            return PostThreadMessageW(fixture.data->tid, WM_APP + 52, 0, 0) && PumpUntil([&] {
+                return data->commandResult != E_PENDING;
+            });
+        };
+        Check(data->lastOwnGeneration == 20, "own callback carries the producing request's generation");
+        InterlockedExchange(&data->reenterLanguage, kRussian);
+        InterlockedExchange64(&data->reenterGeneration, 22);
+        Check(apply(kEnglish, 21) && data->commandResult == HRESULT_FROM_WIN32(ERROR_RETRY) &&
+            data->reenterResult == HRESULT_FROM_WIN32(ERROR_RETRY) && data->confirmedGeneration == 0,
+            "new command during the real TSF callback cancels old confirmation without recursive apply");
+        Check(apply(kEnglish, 21) && data->commandResult == HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH),
+            "superseded generation cannot apply later");
+        Check(apply(kRussian, 22) && data->commandResult == S_OK && data->confirmedGeneration == 22 &&
+            data->commandProfile == kRussian && TargetLanguage(target) == kRussian,
+            "new command applies after reentrant cancellation and confirms the new generation");
+        Check(apply(kEnglish, 22) && data->commandResult == HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH) &&
+            TargetLanguage(target) == kRussian, "same generation cannot be reused for a different language");
+        Check(apply(kRussian, 22) && data->commandResult == S_OK && data->confirmedGeneration == 22,
+            "identical delivery is idempotent");
+        Check(apply(0x0407, 23) && data->commandResult == E_INVALIDARG && TargetLanguage(target) == kRussian,
+            "unsupported language is rejected without affecting the target");
+        Check(apply(kEnglish, 0) && data->commandResult == E_INVALIDARG && TargetLanguage(target) == kRussian,
+            "zero generation is rejected without affecting the target");
+        const auto externalAtApply = data->externalProfiles;
+        InterlockedExchange(&fixture.data->tsfResult, E_PENDING);
+        Check(PostMessageW(target.focus, kHostSelectLanguage, kEnglish, 0) && PumpUntil([&] {
+            return fixture.data->tsfResult != E_PENDING;
+        }) && fixture.data->tsfResult == S_OK && data->externalProfiles > externalAtApply &&
+            TargetLanguage(target) == kEnglish, "immediate host language change is observed without a suppression timer");
+        InterlockedExchange(&data->commandResult, E_PENDING);
+        Check(PostThreadMessageW(fixture.data->tid, WM_APP + 53, 0, 0) && PumpUntil([&] {
+            return data->commandResult != E_PENDING;
+        }) && data->commandResult == S_OK && data->commandProfile == kEnglish && !data->confirmedGeneration,
+            "external change revokes the old application confirmation");
+        Check(apply(kRussian, 22) && data->commandResult == HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH) &&
+            TargetLanguage(target) == kEnglish, "old retry cannot overwrite a subsequent host language choice");
+        Check(apply(kEnglish, 23) && data->commandResult == S_OK && data->confirmedGeneration == 23,
+            "controller can acknowledge the observed language with a fresh generation");
+        // Now exercise the actual module -> queue -> authenticated local IPC
+        // -> host -> command -> target-thread API chain, not shared-page Apply.
+        const auto resetBefore = fixture.data->resetCount;
+        Check(PostThreadMessageW(fixture.data->tid, WM_APP + 51, 0, 0) &&
+            PostMessageW(target.focus, kReset, 0, 0) && PumpUntil([&] {
+                return fixture.data->resetCount != resetBefore;
+            }), "legacy test observer detached before secure-channel exercise");
+        ProfileHost host(fixture.data->pid, fixture.data->tid);
+        Check(host.Start(), "real module host pins the foreign fixture's process incarnation");
+        const auto endpoint = host.Endpoint();
+        data->serverProcess = endpoint.serverProcess.id;
+        InterlockedExchange64(&data->serverCreated, static_cast<LONG64>(endpoint.serverProcess.created));
+        InterlockedExchange64(&data->channelBinding, static_cast<LONG64>(host.Binding()));
+        InterlockedExchange(&data->peerStatus, E_PENDING);
+        Check(PostThreadMessageW(fixture.data->tid, WM_APP + 54, 0, 0) && PumpUntil([&] {
+            return data->peerStatus != E_PENDING;
+        }) && data->peerStatus == S_OK, "module starts private IPC worker without UI-thread network waits");
+        Check(PumpUntil([&] {
+            const auto state = host.Take();
+            return state.sampled && !state.error && !state.confirmed && state.report.actual == kEnglish;
+        }, 3000), "real UI-thread read crosses authenticated channel without fake application success");
+        Check(host.Request(kRussian, 1) && PumpUntil([&] {
+            return host.Take().confirmed && TargetLanguage(target) == kRussian;
+        }, 3000), "absolute RU applies through real module IPC and both target states confirm");
+        InterlockedExchange(&fixture.data->tsfResult, E_PENDING);
+        bool sawExternalEnglish = false;
+        Check(PostMessageW(target.focus, kHostSelectLanguage, kEnglish, 0) && PumpUntil([&] {
+            const auto state = host.Take();
+            for (std::size_t i = 0; i < state.count; ++i)
+                if (state.events[i].cause == profile_channel::Cause::Observed && state.events[i].language == kEnglish)
+                    sawExternalEnglish = true;
+            return sawExternalEnglish && state.report.actual == kEnglish && !state.confirmed;
+        }, 3000), "genuine external TSF event crosses the worker/channel and revokes peer confirmation");
+        Check(host.Request(kEnglish, 2) && PumpUntil([&] { return host.Take().confirmed; }, 3000),
+            "controller adopts the new explicit target through the same secure channel");
+        Check(host.Detach() && PumpUntil([&] { return data->peerDetached != 0; }, 3000),
+            "cooperative detach unsubscribes inside target thread without waiting in its hook");
+        host.Stop();
+        Check(PostThreadMessageW(fixture.data->tid, WM_APP + 56, 0, 0), "test bridge cleanup queued");
+    }
+    if (queuedHook) {
+        PostThreadMessageW(fixture.data->tid, WM_APP + 51, 0, 0);
+        // Barrier through the same target queue before unloading the test DLL.
+        const auto before = fixture.data->resetCount;
+        PostMessageW(fixture.data->window, kReset, 0, 0);
+        PumpUntil([&] { return fixture.data->resetCount != before; });
+        Check(UnhookWindowsHookEx(queuedHook) != FALSE, "queued observer detached");
+    }
+    if (returnedHook) Check(UnhookWindowsHookEx(returnedHook) != FALSE, "returned observer detached");
+    if (!interactive) {
+        const auto target = fixture.Target();
+        wchar_t executable[32768]{};
+        GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
+        const auto image = std::wstring(executable);
+        const auto productionModule = image.substr(0, image.find_last_of(L'\\')) + L"\\profile_module_test.dll";
+        ProfileAttachment denied(fixture.data->pid, fixture.data->tid);
+        Check(!denied.Start(productionModule + L".other") && denied.Error() == ERROR_ACCESS_DENIED,
+            "attachment refuses a module outside its trusted path policy");
+        ProfileAttachment attachment(fixture.data->pid, fixture.data->tid);
+        Check(attachment.Start(productionModule), "production hook owner attaches without the test mapping or command messages");
+        Check(PumpUntil([&] { return !attachment.Take().error; }, 3000),
+            "production module authenticates its fixed server and reports a real UI-thread read");
+        Check(attachment.Request(kRussian, 1) && PumpUntil([&] {
+            const auto state = attachment.Take();
+            return state.confirmed && state.report.actual == kRussian && state.report.profile == kRussian;
+        }, 3000), "production attachment applies RU and confirms both target states");
+        bool observedEnglish = false;
+        Check(PostMessageW(target.focus, kHostSelectLanguage, kEnglish, 0) && PumpUntil([&] {
+            const auto state = attachment.Take();
+            for (std::size_t i = 0; i < state.count; ++i)
+                if (state.events[i].cause == profile_channel::Cause::Observed && state.events[i].language == kEnglish)
+                    observedEnglish = true;
+            return observedEnglish && !state.confirmed && state.report.actual == kEnglish;
+        }, 3000), "production attachment delivers external change without classifying its own application as manual");
+        // Remove endpoint and hook without a cooperative detach command. Only
+        // the DLL's own timer can release the old subscription now.
+        attachment.Stop();
+        Check(!attachment.Take().confirmed, "closed owner immediately revokes confirmation");
+        ProfileAttachment replacement(fixture.data->pid, fixture.data->tid);
+        Check(replacement.Start(productionModule) && replacement.Request(kRussian, 1) && PumpUntil([&] {
+            return replacement.Take().confirmed && TargetLanguage(target) == kRussian;
+        }, 4000), "owner-loss timer releases old peer and replacement binding works in the same live application");
+        replacement.Stop();
+#ifdef CAPSLANG_PROFILE_ENGINE
+        SelectProfileFixture(target);
+        EngineOptions options;
+        options.capture = CaptureProfileFixture;
+        options.profileModule = productionModule;
+        Engine engine(options);
+        Check(engine.Start(), "actual engine starts with module-backed profile controller");
+        const auto applied = [&](core::Language language) {
+            const auto state = engine.Status();
+            return state.target == language && state.actual == language && state.profileConfirmed &&
+                state.profileLanguage == static_cast<LANGID>(language) && state.apply == core::ApplyState::Applied;
+        };
+        Check(engine.SetTarget(core::Language::English) && PumpUntil([&] { return applied(core::Language::English); }, 4000),
+            "engine -> authenticated module -> real target confirms absolute EN without broker TSF");
+        const auto revision = engine.Status().userRevision;
+        Check(PostMessageW(target.focus, kHostSelectLanguage, kRussian, 0) && PumpUntil([&] {
+            return applied(core::Language::Russian) && engine.Status().userRevision == revision + 1;
+        }, 3000), "engine adopts immediate external RU without the legacy suppression interval");
+        Check(PostMessageW(target.focus, kHostSelectLanguage, kEnglish, 0) && PumpUntil([&] {
+            return applied(core::Language::English) && engine.Status().userRevision == revision + 2;
+        }, 3000), "second immediate external change creates one new intent, not an echo loop");
+        const auto beforeRapid = engine.Status().generation;
+        Check(engine.SetTarget(core::Language::Russian) && engine.SetTarget(core::Language::English) && PumpUntil([&] {
+            return engine.Status().generation >= beforeRapid + 2 && applied(core::Language::English) &&
+                engine.Status().userRevision == revision + 2;
+        }, 3000), "rapid absolute requests finish at latest EN without inventing manual revisions");
+        Check(!engine.ProfileReport(kRussian, engine.Status().generation, 0, true),
+            "obsolete broker profile reports cannot compete with target-thread controller");
+        SelectProfileFixture({});
+        Check(PumpUntil([&] { return engine.Status().apply != core::ApplyState::Applied && !engine.Status().profileConfirmed; }),
+            "missing target revokes profile success instead of retaining stale synchronization");
+        InterlockedExchange(&fixture.data->tsfResult, E_PENDING);
+        Check(PostMessageW(target.focus, kHostSelectLanguage, kRussian, 0) && PumpUntil([&] {
+            return fixture.data->tsfResult == S_OK;
+        }), "inactive test window remembers a different language");
+        SelectProfileFixture(target);
+        Check(PumpUntil([&] {
+            return applied(core::Language::English) && engine.Status().userRevision == revision + 2;
+        }, 4000), "returning focus reapplies shared EN, remembered RU is not a user choice");
+        engine.Stop();
+        SelectProfileFixture({});
+#endif
+    }
+    // End the owned child before unloading the module/mapping: no callback can
+    // retain a stale observation page after teardown.
+    SetEvent(fixture.stop);
+    Check(WaitForSingleObject(fixture.process, 2000) == WAIT_OBJECT_0, "observed fixture exits cleanly");
+    UnmapViewOfFile(data); CloseHandle(mapping); FreeLibrary(module);
+}
+#endif
 
 void Tests(const std::wstring& desktop) {
     LayoutApplier applier;
@@ -941,6 +1446,18 @@ void EngineTests(const std::wstring& desktop) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+#ifdef CAPSLANG_MESSAGE_PROBE
+    if (argc == 2 && wcscmp(argv[1], L"--interactive-message-observer") == 0) {
+        wchar_t desktopName[128]{}; DWORD size = 0;
+        if (!GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME,
+            desktopName, sizeof(desktopName), &size) || wcscmp(desktopName, L"Default") != 0)
+            return ERROR_INVALID_FUNCTION;
+        const auto elevation = ProcessElevation(GetCurrentProcessId());
+        if (!elevation.known || elevation.elevated) return ERROR_ACCESS_DENIED;
+        MessageObservationTests(L"Default", true);
+        return failures ? 1 : 0;
+    }
+#endif
     if (argc == 2 && wcscmp(argv[1], L"--token-inventory") == 0) return TokenInventory();
     if (argc == 2 && wcscmp(argv[1], L"--elevated-report") == 0) {
         wchar_t path[32768]{};
@@ -993,7 +1510,7 @@ int wmain(int argc, wchar_t** argv) {
     SECURITY_ATTRIBUTES security{sizeof(security), fixtureSecurity.descriptor, FALSE};
     const HDESK desktop = CreateDesktopW(name.c_str(), nullptr, nullptr, 0,
         DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_ENUMERATE
-#ifdef CAPSLANG_ENGINE_INTEGRATION
+#if defined(CAPSLANG_ENGINE_INTEGRATION) || defined(CAPSLANG_MESSAGE_PROBE)
         | DESKTOP_HOOKCONTROL
 #endif
         , &security);
@@ -1013,6 +1530,9 @@ int wmain(int argc, wchar_t** argv) {
 #endif
 #ifdef CAPSLANG_ENGINE_INTEGRATION
         EngineTests(name);
+#endif
+#ifdef CAPSLANG_MESSAGE_PROBE
+        MessageObservationTests(name);
 #endif
     }
     else Check(false, "COM and installed EN/RU required; no layouts are installed by test");

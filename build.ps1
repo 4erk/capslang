@@ -8,17 +8,18 @@ param(
     [switch]$NetworkTestsOnly,
     [switch]$AppDevOnly,
     [switch]$SaverGuardOnly,
-    [switch]$RecipientProbeOnly
+    [switch]$RecipientProbeOnly,
+    [switch]$MessageProbeOnly
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $NetworkTestsOnly, $AppDevOnly, $SaverGuardOnly, $RecipientProbeOnly) | Where-Object { $_ }).Count -gt 1) {
+if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $NetworkTestsOnly, $AppDevOnly, $SaverGuardOnly, $RecipientProbeOnly, $MessageProbeOnly) | Where-Object { $_ }).Count -gt 1) {
     throw 'Choose only one development build mode.'
 }
 if ($NetworkTestsOnly) { $RuntimeTestsOnly = $true }
-$Release = -not ($ProbeOnly -or $IntegrationOnly -or $RuntimeTestsOnly -or $AppDevOnly -or $SaverGuardOnly -or $RecipientProbeOnly)
+$Release = -not ($ProbeOnly -or $IntegrationOnly -or $RuntimeTestsOnly -or $AppDevOnly -or $SaverGuardOnly -or $RecipientProbeOnly -or $MessageProbeOnly)
 # Some WSL hosts inherit PATHEXT=.CPL. PowerShell then fails to wait for .exe
 # invocations or set LASTEXITCODE. Repair only this build process, and restore
 # the caller's environment even on failure or an early return.
@@ -40,7 +41,9 @@ $downloadUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$toolVe
 $expectedSha256 = 'b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35'
 
 if ($Clean) {
-    if ($AppDevOnly) {
+    if ($MessageProbeOnly) {
+        Remove-Item -LiteralPath (Join-Path $buildDir 'message-probe') -Recurse -Force -ErrorAction SilentlyContinue
+    } elseif ($AppDevOnly) {
         Remove-Item -LiteralPath (Join-Path $buildDir 'app-dev') -Recurse -Force -ErrorAction SilentlyContinue
     } elseif ($RecipientProbeOnly) {
         Remove-Item -LiteralPath (Join-Path $buildDir 'recipient-probe') -Recurse -Force -ErrorAction SilentlyContinue
@@ -85,6 +88,93 @@ if (-not (Test-Path -LiteralPath $windres)) {
     throw "Resource compiler not found after extraction: $windres"
 }
 
+if ($MessageProbeOnly) {
+    # Isolated experimental observer, never linked/copied into the application.
+    function Invoke-ProfileTest([string]$Path, [string]$Report) {
+        $test = New-Object Diagnostics.Process
+        $test.StartInfo.FileName = $Path
+        $test.StartInfo.UseShellExecute = $false
+        $test.StartInfo.CreateNoWindow = $true
+        $test.StartInfo.RedirectStandardOutput = $true
+        $test.StartInfo.RedirectStandardError = $true
+        try {
+            if (-not $test.Start()) { throw "Cannot start $Path" }
+            $stdout = $test.StandardOutput.ReadToEndAsync()
+            $stderr = $test.StandardError.ReadToEndAsync()
+            $completed = $test.WaitForExit(45000)
+            if (-not $completed) { $test.Kill(); $test.WaitForExit() }
+            $result = $stdout.Result + $stderr.Result
+            [IO.File]::WriteAllText($Report, $result, [Text.UTF8Encoding]::new($false))
+            Write-Host $result
+            if (-not $completed -or $test.ExitCode -ne 0) { throw "Profile test failed/timed out: $Path" }
+        } finally { $test.Dispose() }
+    }
+    foreach ($probeArchitecture in @('x64','x86')) {
+    $probeOutput = Join-Path $buildDir ('message-probe\' + $probeArchitecture)
+    $probeCompiler = if ($probeArchitecture -eq 'x86') {
+        Join-Path $expandedRoot 'bin\i686-w64-mingw32-clang++.exe'
+    } else {$compiler}
+    New-Item -ItemType Directory -Force -Path $probeOutput | Out-Null
+    $flags = @('-std=c++17','-O2','-static','-Wall','-Wextra','-Wpedantic','-Werror',
+        '-D_WIN32_WINNT=0x0A00','-DWINVER=0x0A00','-Wl,--no-insert-timestamp')
+    foreach ($unit in @('profile_channel_tests','profile_queue_tests')) {
+        $unitTest = Join-Path $probeOutput ($unit + '.exe')
+        & $probeCompiler @flags (Join-Path $projectRoot ('tests\' + $unit + '.cpp')) '-o' $unitTest
+        if ($LASTEXITCODE -ne 0) { throw "Profile test compilation failed: $unit" }
+        Invoke-ProfileTest $unitTest (Join-Path $probeOutput ($unit + '.txt'))
+    }
+    $hostTest = Join-Path $probeOutput 'windows_profile_host_tests.exe'
+    & $probeCompiler @flags (Join-Path $projectRoot 'tests\windows_profile_host_tests.cpp') `
+        (Join-Path $projectRoot 'src\runtime\profile_host.cpp') `
+        (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
+        (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
+        '-o' $hostTest '-lole32' '-luuid' '-luser32' '-ladvapi32' '-lbcrypt'
+    if ($LASTEXITCODE -ne 0) { throw 'Profile host compilation failed.' }
+    Invoke-ProfileTest $hostTest (Join-Path $probeOutput 'windows_profile_host_tests.txt')
+    & $probeCompiler @flags '-shared' '-Wl,--kill-at' (Join-Path $projectRoot 'tests\layout_message_probe.cpp') `
+        (Join-Path $projectRoot 'src\runtime\thread_profile.cpp') `
+        (Join-Path $projectRoot 'src\runtime\profile_peer.cpp') `
+        (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
+        (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
+        '-o' (Join-Path $probeOutput 'layout_message_probe.dll') '-luser32' '-lole32' '-luuid' '-ladvapi32'
+    if ($LASTEXITCODE -ne 0) { throw 'Message observation DLL compilation failed.' }
+    foreach ($moduleKind in @('test','production')) {
+        $moduleDefines = @()
+        if ($moduleKind -eq 'test') { $moduleDefines += '-DCAPSLANG_PROFILE_TEST' }
+        $moduleName = if ($moduleKind -eq 'test') { 'profile_module_test.dll' } elseif ($probeArchitecture -eq 'x64') {
+            'CapsLangProfile64.dll'
+        } else { 'CapsLangProfile32.dll' }
+        & $probeCompiler @flags @moduleDefines '-shared' '-Wl,--kill-at' `
+            (Join-Path $projectRoot 'src\runtime\profile_module.cpp') `
+            (Join-Path $projectRoot 'src\runtime\thread_profile.cpp') `
+            (Join-Path $projectRoot 'src\runtime\profile_peer.cpp') `
+            (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
+            (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
+            (Join-Path $projectRoot 'src\app\paths.cpp') `
+            '-o' (Join-Path $probeOutput $moduleName) '-luser32' '-lole32' '-luuid' '-ladvapi32' '-lshell32' '-lbcrypt'
+        if ($LASTEXITCODE -ne 0) { throw "Profile module compilation failed: $moduleKind" }
+    }
+    $probeExe = Join-Path $probeOutput 'windows_message_probe.exe'
+    $engineProbe = @()
+    if ($probeArchitecture -eq 'x64') {
+        $engineProbe += '-DCAPSLANG_PROFILE_ENGINE'
+        $engineProbe += (Join-Path $projectRoot 'src\runtime\engine.cpp')
+    }
+    & $probeCompiler @flags @engineProbe '-municode' '-DCAPSLANG_MESSAGE_PROBE' '-DCAPSLANG_PROFILE_TEST' `
+        (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') `
+        (Join-Path $projectRoot 'src\runtime\profile_attachment.cpp') `
+        (Join-Path $projectRoot 'src\app\paths.cpp') `
+        (Join-Path $projectRoot 'src\runtime\profile_host.cpp') `
+        (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
+        (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
+        '-o' $probeExe '-lole32' '-luuid' '-luser32' '-ladvapi32' '-lbcrypt' '-lshell32' '-lwtsapi32'
+    if ($LASTEXITCODE -ne 0) { throw 'Message observation fixture compilation failed.' }
+    Invoke-ProfileTest $probeExe (Join-Path $probeOutput 'results.txt')
+    Write-Host "Message observer architecture: $probeArchitecture"
+    }
+    return
+}
+
 if ($AppDevOnly -or $Release) {
     if ($Release -and -not $SkipTests) {
         & $PSCommandPath -RuntimeTestsOnly
@@ -93,9 +183,33 @@ if ($AppDevOnly -or $Release) {
     New-Item -ItemType Directory -Force -Path $appDir | Out-Null
     $flags = @('-std=c++17', '-O2', '-DNDEBUG', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00',
         '-static', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-Wl,--no-insert-timestamp')
+    $moduleResources = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($architecture in @('64','32')) {
+        $moduleCompiler = if ($architecture -eq '32') {
+            Join-Path $expandedRoot 'bin\i686-w64-mingw32-clang++.exe'
+        } else { $compiler }
+        $moduleDll = Join-Path $appDir ("CapsLangProfile$architecture.dll")
+        & $moduleCompiler @flags '-shared' '-s' '-Wl,--kill-at' `
+            (Join-Path $projectRoot 'src\runtime\profile_module.cpp') `
+            (Join-Path $projectRoot 'src\runtime\thread_profile.cpp') `
+            (Join-Path $projectRoot 'src\runtime\profile_peer.cpp') `
+            (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
+            (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
+            (Join-Path $projectRoot 'src\app\paths.cpp') `
+            '-o' $moduleDll '-luser32' '-lole32' '-luuid' '-ladvapi32' '-lshell32' '-lbcrypt'
+        if ($LASTEXITCODE -ne 0) { throw "Production profile module compilation failed: $architecture" }
+        $resourceId = if ($architecture -eq '64') { 4101 } else { 4102 }
+        $moduleResources.Add(('{0} RCDATA "{1}"' -f $resourceId, $moduleDll.Replace('\','/')))
+    }
+    $modulesRc = Join-Path $appDir 'profile-modules.rc'
+    $modulesRes = Join-Path $appDir 'profile-modules.res'
+    [IO.File]::WriteAllLines($modulesRc, $moduleResources, [Text.UTF8Encoding]::new($false))
+    & $windres '--codepage=65001' $modulesRc '-O' 'coff' '-o' $modulesRes
+    if ($LASTEXITCODE -ne 0) { throw 'Profile module resource compilation failed.' }
     $appSources = @('app\control.cpp','app\broker.cpp','app\paths.cpp','app\tasks.cpp',
-        'app\install_store.cpp','app\installer.cpp','app\migration.cpp','app\firewall.cpp',
+        'app\install_store.cpp','app\installer.cpp','app\migration.cpp','app\firewall.cpp','app\profile_assets.cpp',
         'runtime\local_ipc.cpp','runtime\system_layout.cpp','runtime\engine_client.cpp','platform\windows_support.cpp',
+        'runtime\profile_host.cpp','runtime\profile_attachment.cpp',
         'network\runtime.cpp','network\application_mode.cpp','network\paired_connection.cpp',
         'network\enrollment.cpp','network\session.cpp','network\lan.cpp',
         'network\pairing.cpp','network\tls.cpp','platform\private_store.cpp') |
@@ -104,7 +218,7 @@ if ($AppDevOnly -or $Release) {
         '-lws2_32','-liphlpapi','-lsecur32','-lcrypt32','-lncrypt','-lbcrypt','-lversion','-lwtsapi32')
     if (-not $SkipTests) {
         $appTest = Join-Path $appDir 'windows_app_tests.exe'
-        & $compiler @flags (Join-Path $projectRoot 'tests\windows_app_tests.cpp') @appSources '-o' $appTest @libs
+        & $compiler @flags (Join-Path $projectRoot 'tests\windows_app_tests.cpp') @appSources $modulesRes '-o' $appTest @libs
         if ($LASTEXITCODE -ne 0) { throw 'Application test compilation failed.' }
         $test = New-Object System.Diagnostics.Process
         $test.StartInfo.FileName = $appTest
@@ -130,7 +244,7 @@ if ($AppDevOnly -or $Release) {
         (Join-Path $projectRoot 'src\app\saver.cpp') `
         (Join-Path $projectRoot 'src\app\window.cpp') @appSources `
         (Join-Path $projectRoot 'src\runtime\engine_host.cpp') (Join-Path $projectRoot 'src\runtime\engine.cpp') `
-        $resource '-o' $appExe @libs '-lwtsapi32' '-lversion' '-lwintrust'
+        $resource $modulesRes '-o' $appExe @libs '-lwtsapi32' '-lversion' '-lwintrust'
     if ($LASTEXITCODE -ne 0) { throw 'Development application compilation failed.' }
     if ($Release) {
         $releaseExe = Join-Path $distDir 'CapsLang.exe'
@@ -212,6 +326,14 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags (Join-Path $projectRoot 'tests\system_layout_tests.cpp') '-o' $systemProtocol
     if ($LASTEXITCODE -ne 0) { throw 'SYSTEM protocol compilation failed.' }
     Invoke-BoundedTest $systemProtocol
+    $profileProtocol = Join-Path $integrationDir 'profile_channel_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\profile_channel_tests.cpp') '-o' $profileProtocol
+    if ($LASTEXITCODE -ne 0) { throw 'Profile channel protocol compilation failed.' }
+    Invoke-BoundedTest $profileProtocol
+    $profileQueue = Join-Path $integrationDir 'profile_queue_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\profile_queue_tests.cpp') '-o' $profileQueue
+    if ($LASTEXITCODE -ne 0) { throw 'Profile queue compilation failed.' }
+    Invoke-BoundedTest $profileQueue
     $settingsTest = Join-Path $integrationDir 'settings_tests.exe'
     & $compiler @flags (Join-Path $projectRoot 'tests\settings_tests.cpp') '-o' $settingsTest
     if ($LASTEXITCODE -ne 0) { throw 'Selective settings test compilation failed.' }
@@ -246,6 +368,8 @@ if ($RuntimeTestsOnly) {
     & $compiler @flags '-municode' '-DCAPSLANG_ENGINE_INTEGRATION' `
         (Join-Path $projectRoot 'tests\windows_layout_integration.cpp') $platform `
         (Join-Path $projectRoot 'src\runtime\engine.cpp') (Join-Path $projectRoot 'src\platform\mwb.cpp') `
+        (Join-Path $projectRoot 'src\runtime\profile_attachment.cpp') (Join-Path $projectRoot 'src\runtime\profile_host.cpp') `
+        (Join-Path $projectRoot 'src\app\paths.cpp') `
         (Join-Path $projectRoot 'src\runtime\mwb_monitor.cpp') `
         (Join-Path $projectRoot 'src\runtime\engine_host.cpp') `
         (Join-Path $projectRoot 'src\runtime\engine_client.cpp') `
@@ -253,10 +377,16 @@ if ($RuntimeTestsOnly) {
         (Join-Path $projectRoot 'src\network\pairing.cpp') (Join-Path $projectRoot 'src\network\tls.cpp') `
         (Join-Path $projectRoot 'src\platform\private_store.cpp') `
         (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
-        '-o' $engine @libs '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32' '-lbcrypt' '-lws2_32' '-liphlpapi' '-lsecur32' '-lncrypt'
+        '-o' $engine @libs '-lwtsapi32' '-lversion' '-lwintrust' '-lcrypt32' '-lbcrypt' '-lws2_32' '-liphlpapi' '-lsecur32' '-lncrypt' '-lshell32'
     if ($LASTEXITCODE -ne 0) { throw 'Engine integration compilation failed.' }
     Invoke-BoundedTest $engine
     $ipc = Join-Path $integrationDir 'windows_ipc_tests.exe'
+    $profileHost = Join-Path $integrationDir 'windows_profile_host_tests.exe'
+    & $compiler @flags (Join-Path $projectRoot 'tests\windows_profile_host_tests.cpp') `
+        (Join-Path $projectRoot 'src\runtime\profile_host.cpp') `
+        (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') $platform '-o' $profileHost @libs '-lbcrypt'
+    if ($LASTEXITCODE -ne 0) { throw 'Profile host compilation failed.' }
+    Invoke-BoundedTest $profileHost
     & $compiler @flags (Join-Path $projectRoot 'tests\windows_ipc_tests.cpp') `
         (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') $platform '-o' $ipc @libs
     if ($LASTEXITCODE -ne 0) { throw 'IPC test compilation failed.' }

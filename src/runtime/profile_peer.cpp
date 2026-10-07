@@ -104,7 +104,7 @@ struct ProfilePeer::Impl {
     std::uint64_t processed = 0;
     Impl(ipc::Endpoint endpoint, std::uint64_t binding, std::wstring server, bool high)
         : state(std::make_shared<Transport>(std::move(endpoint), binding, std::move(server), high)),
-          profile(Notify, state.get()) {}
+          profile(Notify, state.get(), nullptr, true, true) {}
     ~Impl() { state->stop = true; profile.Unbind(); }
     void Send(std::uint64_t command, ThreadProfile::Result result) {
         Update update; update.command = command; update.result = result;

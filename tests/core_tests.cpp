@@ -102,6 +102,20 @@ int main() {
     check(layout.RequestPeer(Language::English, manualRevision, 2506), "focus-only changes do not invalidate user intent revision");
     LayoutState retry;
     retry.Initialize(Language::English);
+    LayoutState queueRetry;
+    queueRetry.Initialize(Language::English);
+    queueRetry.Request(Language::Russian, Origin::Peer, 1);
+    const auto queuedGeneration = queueRetry.Generation();
+    queueRetry.QueueFailed(queuedGeneration, 1);
+    check(!queueRetry.Due(150) && queueRetry.Due(151) && queueRetry.State() == ApplyState::Pending,
+          "failed queue delivery backs off without pretending to send");
+    queueRetry.QueueFailed(queuedGeneration - 1, 151);
+    check(queueRetry.Due(151), "obsolete queue failure cannot delay current intent");
+    queueRetry.Observe(Language::English, queuedGeneration, 1001);
+    check(queueRetry.State() == ApplyState::Failed, "queue failure does not restart application deadline");
+    queueRetry.Toggle(1002);
+    check(queueRetry.Due(1002) && queueRetry.Target() == Language::English,
+          "new explicit choice immediately cancels failed-queue backoff");
     retry.Request(Language::Russian, Origin::Peer, 10);
     const auto retryGeneration = retry.Generation();
     retry.Sent(retryGeneration, 10);

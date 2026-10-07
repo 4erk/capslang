@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "probe_trace.hpp"
 #include "profile_attachment.hpp"
 #include "../platform/mwb_presence.hpp"
 #include "../core/keyboard.hpp"
@@ -44,6 +45,7 @@ struct Engine::Impl {
     LayoutTarget target;
     std::unique_ptr<LayoutApplier> applier;
     std::unique_ptr<ProfileAttachment> profileAttachment;
+    bool profileSystem = false;
     profile_channel::IntentOrder intentOrder;
     ULONGLONG nextProfileAttach = 0, profileAttachedAt = 0;
     DWORD session = 0, mwbError = ERROR_NOT_READY;
@@ -63,6 +65,10 @@ struct Engine::Impl {
     std::atomic<ULONGLONG> hookBeat{0}, hookRecovered{0}, physicalInput{0}, injectedKeyInput{0};
     std::atomic<unsigned> recoveryCount{0};
     core::KeyboardState keys;
+    EngineOptions::CapsBatch capsStatus;
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+    ProbeCapsCounters capsProbe;
+#endif
     HPOWERNOTIFY power = nullptr;
     bool wts = false, locked = false, ticking = false;
     ULONGLONG manualUntil = 0, ownApplyUntil = 0;
@@ -71,6 +77,9 @@ struct Engine::Impl {
 
     explicit Impl(EngineOptions value) : options(value) {}
     void Publish() {
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+        capsProbe.Flush("engine");
+#endif
         const auto now = GetTickCount64();
         if (now >= nextMwbSample) {
             mwbRunning = MwbRunningInSession(session, mwbError);
@@ -86,7 +95,7 @@ struct Engine::Impl {
         status.profileConfirmed = profileSampled && now - profileSampled < 1000 &&
             profileGeneration == layout.Generation() && !profileError &&
             profileLanguage == static_cast<LANGID>(layout.Target());
-        status.systemEnabled = static_cast<bool>(options.systemApply);
+        status.systemEnabled = static_cast<bool>(options.systemApply) || static_cast<bool>(options.systemProfile);
         status.targetThreadProfile = !options.profileModule.empty();
         status.generation = layout.Generation(); status.userRevision = layout.UserRevision();
         status.locked = locked; status.hookRegistered = installed.load();
@@ -94,6 +103,11 @@ struct Engine::Impl {
         if (!status.hookError) status.hookError = rawError.load();
         const auto heartbeat = hookBeat.load();
         status.hookThreadResponsive = heartbeat && GetTickCount64() - heartbeat < 2000;
+        if (options.systemCaps) {
+            status.hookError = capsStatus.error;
+            status.hookRegistered = !capsStatus.error && capsStatus.heartbeat;
+            status.hookThreadResponsive = capsStatus.heartbeat && now >= capsStatus.heartbeat && now-capsStatus.heartbeat < 2000;
+        }
         status.recoveries = recoveryCount.load(); status.lastRecovery = hookRecovered.load();
         status.lastPhysicalInput = physicalInput.load();
         status.lastInjectedKeyInput = injectedKeyInput.load();
@@ -115,6 +129,10 @@ struct Engine::Impl {
         const auto data = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(pointer);
         const bool own = data.dwExtraInfo == kLegacyInput || data.dwExtraInfo == kLegacyProbe;
         const LRESULT next = CallNextHookEx(nullptr, code, message, pointer);
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+        if (!own && data.vkCode == VK_CAPITAL)
+            self->capsProbe.Observe(Down(message), (data.flags & LLKHF_INJECTED) != 0, next != 0);
+#endif
         // Calling the rest of the chain FIRST lets MWB forward/suppress at the
         // source regardless of hook installation order. No duplicate local toggle.
         if (own || next != 0) return next;
@@ -132,10 +150,14 @@ struct Engine::Impl {
                 PostMessageW(owner, kManual, 0, 0);
         }
         if (data.vkCode != VK_CAPITAL) return next;
+        if (self->options.systemCaps) return next; // SYSTEM is the only Caps decision owner.
         const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         const auto decision = self->keys.Caps(Down(message) ? core::Edge::Down : core::Edge::Up,
                                               shift, false, false, data.time);
         if (decision.toggle) PostMessageW(owner, kToggle, 0, static_cast<LPARAM>(SequenceStamp()));
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+        if (decision.toggle) ++self->capsProbe.toggles;
+#endif
         return decision.suppress ? 1 : next;
     }
     static LRESULT CALLBACK RawRelease(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
@@ -229,11 +251,15 @@ struct Engine::Impl {
     }
     void ModuleTick(ULONGLONG now) {
         if (locked) {
+            if (profileSystem && options.releaseSystemProfile) options.releaseSystemProfile();
+            profileSystem = false;
             profileAttachment.reset(); profileSampled = 0; profileError = ERROR_NOT_READY;
             Publish(); return;
         }
         const auto focus = options.capture();
         if (!TargetStillValid(focus)) {
+            if (profileSystem && options.releaseSystemProfile) options.releaseSystemProfile();
+            profileSystem = false;
             profileAttachment.reset(); target = {}; profileSampled = 0;
             observed = core::Language::Unknown; profileError = ERROR_INVALID_WINDOW_HANDLE;
             layout.Observe(core::Language::Unknown, layout.Generation(), now);
@@ -241,27 +267,48 @@ struct Engine::Impl {
         }
         const bool changed = focus.focus != target.focus || focus.threadId != target.threadId || focus.processId != target.processId;
         if (changed) {
-            if (focus.threadId != target.threadId || focus.processId != target.processId) profileAttachment.reset();
+            if (focus.threadId != target.threadId || focus.processId != target.processId) {
+                profileAttachment.reset();
+                if (profileSystem && options.releaseSystemProfile) options.releaseSystemProfile();
+                profileSystem = false;
+            }
             target = focus; intentOrder.Boundary(SequenceStamp());
             layout.FocusChanged(now); nextProfileAttach = 0;
             profileSampled = 0;
         }
-        if (!profileAttachment && now >= nextProfileAttach) {
+        if (!profileAttachment && !profileSystem && now >= nextProfileAttach) {
             nextProfileAttach = now + 1000;
             auto attached = std::make_unique<ProfileAttachment>(target.processId, target.threadId);
             if (attached->Start(options.profileModule)) {
                 profileAttachment = std::move(attached); profileAttachedAt = now;
                 intentOrder.Boundary(SequenceStamp());
-            } else profileError = attached->Error();
+            } else {
+                profileError = attached->Error();
+                // The SYSTEM role independently validates account, session,
+                // foreground and desktop. It cannot load a module for an
+                // arbitrary PID or a second user's process.
+                if (profileError == ERROR_ACCESS_DENIED && options.systemProfile) {
+                    profileSystem = true; profileAttachedAt = now;
+                }
+            }
         }
         observed = static_cast<core::Language>(TargetLanguage(target));
-        if (profileAttachment) {
-            const auto sample = profileAttachment->Take();
+        if (profileAttachment || profileSystem) {
+            const auto requestedGeneration = layout.Generation();
+            const auto sample = profileAttachment ? profileAttachment->Take() :
+                options.systemProfile(target, static_cast<LANGID>(layout.Target()), requestedGeneration);
             profileSampled = sample.sampled;
             profileError = sample.error;
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+            ProbeTrace(profileSystem ? "engine-system" : "engine-user", target, sample.error);
+#endif
             profileLanguage = static_cast<LANGID>(sample.report.profile);
             profileGeneration = sample.report.confirmedGeneration;
-            if (!changed && !sample.error) {
+            // Notifications have already passed the binding, process and
+            // sequence checks in ProfileHost. A failed/stale *measurement*
+            // must revoke application confirmation, not discard a user's
+            // separately authenticated language notification.
+            if (!changed) {
                 for (std::size_t i = 0; i < sample.count; ++i) {
                     const auto& event = sample.events[i];
                     if (intentOrder.Accept(event) && event.language != static_cast<LANGID>(layout.Target()))
@@ -273,14 +320,23 @@ struct Engine::Impl {
             layout.Observe(confirmed ? observed : core::Language::Unknown, layout.Generation(), now);
             if (layout.Due(now)) {
                 const auto generation = layout.Generation();
-                if (!profileAttachment->Request(static_cast<LANGID>(layout.Target()), generation)) profileError = ERROR_RETRY;
-                layout.Sent(generation, now);
+                const bool delivered = profileAttachment ?
+                    profileAttachment->Request(static_cast<LANGID>(layout.Target()), generation) :
+                    sample.report.binding && requestedGeneration == generation;
+                if (delivered)
+                    layout.Sent(generation, now);
+                else {
+                    profileError = ERROR_RETRY;
+                    layout.QueueFailed(generation, now);
+                }
             }
             // Transport loss is not evidence of manual language selection.
             // A new binding re-establishes a baseline and retries the desired
             // state; it never claims a fresh application without a UI read.
             const auto lastRead = sample.sampled ? sample.sampled : profileAttachedAt;
             if (sample.error && now - lastRead >= 2000) {
+                if (profileSystem && options.releaseSystemProfile) options.releaseSystemProfile();
+                profileSystem = false;
                 profileAttachment.reset(); profileSampled = 0; nextProfileAttach = now + 500;
             }
         } else layout.Observe(core::Language::Unknown, layout.Generation(), now);
@@ -294,6 +350,18 @@ struct Engine::Impl {
         if (ticking) return;
         ticking = true;
         struct TickGuard { bool& active; ~TickGuard() { active = false; } } guard{ticking};
+        if (options.systemCaps) {
+            capsStatus = options.systemCaps();
+            // Intents received just before lock remain desired state. The
+            // layout controller defers application while locked; dropping an
+            // acknowledged Caps event here would lose the user's choice.
+            if (!capsStatus.error && capsStatus.count <= 8) {
+                for (unsigned i = 0; i < capsStatus.count; ++i) {
+                    intentOrder.Boundary(capsStatus.stamps[i]);
+                    layout.Toggle(GetTickCount64());
+                }
+            }
+        }
         const auto now = GetTickCount64();
         if (!options.profileModule.empty()) { ModuleTick(now); return; }
         if (locked) { Publish(); return; }
@@ -465,6 +533,10 @@ struct Engine::Impl {
         if (self.hookReady) self.hook = CreateThread(nullptr, 0, HookThread, &self, 0, nullptr);
         if (self.hook) WaitForSingleObject(self.hookReady, 3000);
         const auto timer = SetTimer(hwnd, 1, 20, nullptr);
+        // Establish the SYSTEM Caps lease before EngineHost checks startup
+        // readiness. Its initial status is deliberately NOT_READY, not a
+        // substitute for the first authenticated poll.
+        if (self.options.systemCaps) self.Tick();
         self.Publish(); SetEvent(self.workerReady);
         MSG msg{};
         if (!timer) { self.Error(&EngineStatus::layoutError, GetLastError()); self.stopping = true; }
@@ -490,6 +562,8 @@ struct Engine::Impl {
         self.Publish();
         self.applier.reset(); // Release TSF on its owning STA before COM shutdown.
         self.profileAttachment.reset();
+        if (self.profileSystem && self.options.releaseSystemProfile) self.options.releaseSystemProfile();
+        self.profileSystem = false;
         CoUninitialize(); return 0;
     }
 };

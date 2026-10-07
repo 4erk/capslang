@@ -1,5 +1,8 @@
 #include "../runtime/engine_host.hpp"
 #include "../runtime/system_layout.hpp"
+#include "../runtime/system_profile.hpp"
+#include "../runtime/system_caps.hpp"
+#include "profile_assets.hpp"
 #include "installer.hpp"
 #include "paths.hpp"
 #include "tasks.hpp"
@@ -10,6 +13,8 @@
 using namespace capslang;
 using namespace capslang::app;
 int CapsLangSaverMain();
+bool StartCapsLangSaver();
+void StopCapsLangSaver();
 namespace {
 bool Output(const std::string &value) {
     DWORD written = 0;
@@ -30,6 +35,54 @@ int Main(const std::vector<std::wstring> &args) {
     if (executable.empty())
         return ERROR_BAD_PATHNAME;
     const auto mode = args.empty() ? L"" : args[0];
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+    const bool probeStatus = args.size() == 2 && mode == std::wstring(L"--status") && args[1] == L"--json";
+    if (args.size() != 1 && !probeStatus) return ERROR_INVALID_PARAMETER;
+    if (mode == std::wstring(L"--profile-probe-system")) return system_layout::ProbeWorker();
+    if (mode == std::wstring(L"--profile-probe-stage")) {
+        const auto elevation = ProcessElevation(GetCurrentProcessId());
+        const auto user = ipc::Endpoint::Current();
+        DWORD error = 0;
+        if (!elevation.known || !elevation.elevated || user.error || !user.session) return ERROR_ACCESS_DENIED;
+        const auto installed = InstalledExecutable(error);
+        if (installed.empty() || _wcsicmp(installed.c_str(), executable.c_str()) == 0) return ERROR_INVALID_PARAMETER;
+        const auto root = installed.substr(0, installed.find_last_of(L'\\'));
+        install::Hash hash{};
+        const auto owner = L"CapsLang protected installation v1\n" + user.sid;
+        std::vector<BYTE> bytes(owner.size() * sizeof(wchar_t));
+        memcpy(bytes.data(), owner.data(), bytes.size());
+        if (!install::CreateRoot(root, error) ||
+            !install::WriteProtected(root + L"\\owner.bin", bytes, true, error) ||
+            !StageProfileAssets(GetModuleHandleW(nullptr), root, error) ||
+            !install::CopyProtected(executable, installed, hash, error)) return error;
+        return 0;
+    }
+    if (mode == std::wstring(L"--profile-probe-client")) {
+        DWORD error = 0;
+        const auto elevation = ProcessElevation(GetCurrentProcessId());
+        if (!elevation.known || !elevation.elevated || !ProtectedExecutable(executable, error)) return ERROR_ACCESS_DENIED;
+        system_profile::Client client(executable);
+        const auto begin = GetTickCount64();
+        DWORD lastError = DWORD(-1); std::uint64_t lastPoll = 0;
+        while (GetTickCount64() - begin < 60000) {
+            const auto age = GetTickCount64() - begin;
+            const LANGID language = age < 30000 ? 0x0419 : 0x0409;
+            const auto state = client.Apply(CaptureLayoutTarget(), language, age < 30000 ? 1 : 2);
+            if (state.error != lastError || (state.report.poll && age / 1000 != lastPoll)) {
+                Output("{\"elapsed_ms\":" + std::to_string(age) + ",\"target\":" + std::to_string(language) +
+                    ",\"actual\":" + std::to_string(state.report.actual) + ",\"profile\":" + std::to_string(state.report.profile) +
+                    ",\"confirmed\":" + std::to_string(state.confirmed) + ",\"error\":" + std::to_string(state.error) + "}\n");
+                lastError = state.error; lastPoll = age / 1000;
+            }
+            Sleep(100);
+        }
+        return 0;
+    }
+    // Full two-device diagnostic uses the ordinary production roles against
+    // the isolated protected root. No install/pair/unpair commands are exposed.
+    if (mode != std::wstring(L"--layout-worker") && mode != std::wstring(L"--engine") &&
+        mode != std::wstring(L"--background") && !probeStatus) return ERROR_INVALID_PARAMETER;
+#endif
     if (mode == std::wstring(L"--saver-guard") || mode == std::wstring(L"--saver-watch") ||
         mode == std::wstring(L"--saver-status") || mode == std::wstring(L"--saver-stop")) {
         const auto elevated = ProcessElevation(GetCurrentProcessId());
@@ -62,11 +115,10 @@ int Main(const std::vector<std::wstring> &args) {
     if (mode == std::wstring(L"--abort-install"))
         return static_cast<int>(AbortMigration());
     if (mode == std::wstring(L"--install") || mode == std::wstring(L"--uninstall") ||
-        mode == std::wstring(L"--rollback") || mode == std::wstring(L"--restore-legacy")) {
+        mode == std::wstring(L"--rollback")) {
         const auto action = mode == std::wstring(L"--install")     ? UserAction::Install
                             : mode == std::wstring(L"--uninstall") ? UserAction::Uninstall
-                            : mode == std::wstring(L"--rollback")  ? UserAction::Rollback
-                                                                   : UserAction::RestoreLegacy;
+                                                                   : UserAction::Rollback;
         const auto result = UserInstall(action);
         if (result)
             return Failure(result, true);
@@ -86,15 +138,21 @@ int Main(const std::vector<std::wstring> &args) {
         if (FindWindowW(L"CapsLang.Reliable.HiddenWindow.1", nullptr))
             return ERROR_BUSY;
         EngineOptions options;
-        options.requireDesktopProfile = true;
-        options.systemApply = [executable](LANGID language) {
-            system_layout::Request request;
-            request.id = GetTickCount64() + 1;
-            request.operation = system_layout::Operation::Apply;
-            request.language = language;
-            system_layout::Response response; DWORD failure = 0;
-            system_layout::Call(executable, request, response, failure);
-            return failure;
+        options.profileModule = InstalledProfileModule(IMAGE_FILE_MACHINE_AMD64, error);
+        if (options.profileModule.empty()) return Failure(error, false);
+        auto system = std::make_shared<system_profile::Client>(executable);
+        options.systemProfile = [system](const LayoutTarget& target, LANGID language, std::uint64_t generation) {
+            return system->Apply(target, language, generation);
+        };
+        options.releaseSystemProfile = [system] { system->Release(); };
+        auto caps = std::make_shared<system_caps::Client>(executable);
+        options.systemCaps = [caps] {
+            const auto result = caps->Poll();
+            EngineOptions::CapsBatch batch;
+            batch.error = result.error; batch.heartbeat = result.heartbeat; batch.recoveries = result.recoveries;
+            batch.count = result.count;
+            for (unsigned i = 0; i < result.count && i < 8; ++i) batch.stamps[i] = result.events[i].stamp;
+            return batch;
         };
         EngineHost host(ipc::Endpoint::Current(), options);
         if (!host.Start())
@@ -214,16 +272,19 @@ int Main(const std::vector<std::wstring> &args) {
     Broker broker(directory, EngineDependencies(executable, !portable));
     if (!broker.Start())
         return Failure(broker.Error(), !background);
-    // An already running standalone Guard keeps its lease and settings. The
-    // embedded role shares its singleton, so the upgrade never doubles it.
-    StartSelf(L"--saver-guard", error);
+    // The lease runs in this ordinary owner process; only crash restoration
+    // needs a separate minimal watchdog. Keep the legacy guard until migration.
+#ifndef CAPSLANG_SYSTEM_PROFILE_PROBE
+    if (!StartCapsLangSaver()) { broker.Stop(); return Failure(ERROR_NOT_READY,!background); }
+#endif
     const int result =
-        RunWindow(broker, directory, !background, host ? host->ShutdownEvent() : nullptr, true);
+        RunWindow(broker, directory, !background, host ? host->ShutdownEvent() : nullptr);
     // Portable engine belongs to this UI owner. Remove its endpoint before
     // joining the broker that may be waiting for shutdown confirmation.
     if (host)
         host->Stop();
     broker.Stop();
+    StopCapsLangSaver();
     return result ? result : static_cast<int>(broker.Error());
 }
 } // namespace

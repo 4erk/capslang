@@ -47,6 +47,13 @@ public:
         ++attempts_;
         nextAttempt_ = now + (attempts_ == 1 ? 150 : 300);
     }
+    void QueueFailed(std::uint64_t generation, std::uint64_t now) {
+        if (generation != generation_ || locked_ ||
+            (state_ != ApplyState::Pending && state_ != ApplyState::Failed)) return;
+        // No delivery was made, so do not spend an application attempt or
+        // restart its deadline. Still bound retries when the owner is busy.
+        nextAttempt_ = now > UINT64_MAX - 150 ? UINT64_MAX : now + 150;
+    }
     void Observe(Language actual, std::uint64_t generation, std::uint64_t now) {
         if (generation != generation_ || locked_) return;
         actual_ = actual;

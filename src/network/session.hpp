@@ -2,6 +2,7 @@
 #include "tls.hpp"
 #include "../core/session_wire.hpp"
 #include <functional>
+#include <memory>
 
 namespace capslang::net {
 enum class SessionPhase { Reconciling, AwaitInput, Active, Ended };
@@ -11,11 +12,18 @@ struct SessionStatus {
     sync::Applied peerApplied = sync::Applied::None;
     DWORD error = 0;
 };
+// Kept by the ordinary network worker across TLS reconnects, not on disk:
+// after a process restart, monotonic choice ages are deliberately unknown.
+struct ReconnectCheckpoint {
+    sync::Id local{}, peer{};
+    sync::Baseline localBaseline{}, peerBaseline{};
+};
 struct SessionEndpoint {
-    // Must sample the actual engine and a separately verified recipient source.
+    // Samples explicit language intent and verified actual application.
     std::function<bool(sync::LocalState&)> read;
     std::function<bool(const sync::ApplyCommand&)> queue;
     std::function<void(const SessionStatus&)> publish;
+    std::shared_ptr<ReconnectCheckpoint> checkpoint{};
 };
 // Single ordinary worker owns TLS and IPC. Local hooks never wait on it.
 // coordinator is a transport role only. Connection IDs are random, identities

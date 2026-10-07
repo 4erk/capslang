@@ -40,8 +40,10 @@ struct ThreadProfile::Impl final : ITfInputProcessorProfileActivationSink {
     std::uint64_t serial = 0, latest = 0, active = 0, confirmed = 0, invalidated = 0;
     LANGID requested = 0, activeLanguage = 0;
     bool binding = false, busy = false, interrupted = false, closing = false, resolving = false;
-    Impl(Notify callback, void* owner, GetManager getter)
-        : notify(callback), context(owner), get(getter ? getter : ExistingManager) {}
+    bool prepareClient = false, desktopScope = false, comReference = false, ownedActivation = false;
+    Impl(Notify callback, void* owner, GetManager getter, bool prepare, bool desktop)
+        : notify(callback), context(owner), get(getter ? getter : ExistingManager),
+          prepareClient(prepare), desktopScope(desktop) {}
     bool SameThread() const { return GetCurrentThreadId() == threadId; }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
         if (!out) return E_POINTER;
@@ -92,9 +94,15 @@ struct ThreadProfile::Impl final : ITfInputProcessorProfileActivationSink {
             cookie = TF_INVALID_COOKIE;
         }
         if (source) { source->Release(); source = nullptr; }
+        if (ownedActivation && thread) {
+            const auto result = thread->Deactivate();
+            if (FAILED(result)) { error = result; return result; }
+            ownedActivation = false;
+        }
         if (manager) { manager->Release(); manager = nullptr; }
         if (profiles) { profiles->Release(); profiles = nullptr; }
         if (thread) { thread->Release(); thread = nullptr; }
+        if (comReference) { comReference = false; CoUninitialize(); }
         confirmed = 0; error = HRESULT_FROM_WIN32(ERROR_NOT_READY);
         closing = false; return S_OK;
     }
@@ -106,6 +114,25 @@ struct ThreadProfile::Impl final : ITfInputProcessorProfileActivationSink {
         if (FAILED(cleanup)) return cleanup;
         binding = true;
         error = get(&thread);
+        if (prepareClient) {
+            // TF_GetThreadMgr may return an existing but inactive manager.
+            // Own one balanced activation even when the manager already exists;
+            // merely having its pointer does not enable profile notifications.
+            const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            if (SUCCEEDED(initialized)) comReference = true;
+            if (SUCCEEDED(initialized)) {
+                if (FAILED(error) || !thread) {
+                    if (thread) { thread->Release(); thread = nullptr; }
+                    error = CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER,
+                        IID_ITfThreadMgr, reinterpret_cast<void**>(&thread));
+                }
+                if (SUCCEEDED(error)) {
+                    TfClientId client = 0;
+                    error = thread->Activate(&client);
+                    ownedActivation = SUCCEEDED(error);
+                }
+            } else error = initialized;
+        }
         if (SUCCEEDED(error) && !thread) error = HRESULT_FROM_WIN32(ERROR_NOT_READY);
         if (SUCCEEDED(error)) error = thread->QueryInterface(IID_ITfSource, reinterpret_cast<void**>(&source));
         if (SUCCEEDED(error)) error = source->AdviseSink(IID_ITfInputProcessorProfileActivationSink, this, &cookie);
@@ -122,6 +149,14 @@ struct ThreadProfile::Impl final : ITfInputProcessorProfileActivationSink {
         ITfInputProcessorProfileMgr* newManager = nullptr;
         HRESULT result = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr,
             CLSCTX_INPROC_SERVER, IID_ITfInputProcessorProfiles, reinterpret_cast<void**>(&newProfiles));
+        if (result == CO_E_NOTINITIALIZED && prepareClient && !comReference) {
+            const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            if (SUCCEEDED(initialized)) {
+                comReference = true;
+                result = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
+                    IID_ITfInputProcessorProfiles, reinterpret_cast<void**>(&newProfiles));
+            } else result = initialized;
+        }
         if (SUCCEEDED(result)) result = newProfiles->QueryInterface(IID_ITfInputProcessorProfileMgr,
             reinterpret_cast<void**>(&newManager));
         if (SUCCEEDED(result)) { profiles = newProfiles; manager = newManager; }
@@ -171,7 +206,9 @@ struct ThreadProfile::Impl final : ITfInputProcessorProfileActivationSink {
         const auto current = [&] { return latest == generation && !interrupted; };
         result.error = profiles->ChangeCurrentLanguage(language);
         if (SUCCEEDED(result.error) && current()) result.error = manager->ActivateProfile(
-            TF_PROFILETYPE_KEYBOARDLAYOUT, language, CLSID_NULL, GUID_NULL, layout, 0);
+            // SDK value for TF_IPPMF_FORSESSION (absent from LLVM-MinGW's header).
+            TF_PROFILETYPE_KEYBOARDLAYOUT, language, CLSID_NULL, GUID_NULL, layout,
+            desktopScope ? 0x20000000u : 0u);
         if (SUCCEEDED(result.error) && current() && !ActivateKeyboardLayout(layout, 0))
             result.error = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         if (SUCCEEDED(result.error) && !current()) result.error = HRESULT_FROM_WIN32(ERROR_RETRY);
@@ -186,8 +223,8 @@ struct ThreadProfile::Impl final : ITfInputProcessorProfileActivationSink {
         return result;
     }
 };
-ThreadProfile::ThreadProfile(Notify notify, void* context, GetManager get)
-    : impl_(new Impl(notify, context, get)) {}
+ThreadProfile::ThreadProfile(Notify notify, void* context, GetManager get, bool prepareClient, bool desktopScope)
+    : impl_(new Impl(notify, context, get, prepareClient, desktopScope)) {}
 ThreadProfile::~ThreadProfile() {
     // Explicit Unbind is required before module unload. On failure retain the
     // COM-held object, but prevent access to the now-dead owner's context.

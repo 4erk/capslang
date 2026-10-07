@@ -19,6 +19,7 @@ struct NetworkRuntime::Impl {
     enum class Action { None, Invite, Join, Unpair };
     std::wstring directory, identityPath, pairPath;
     SessionEndpoint engine;
+    std::shared_ptr<ReconnectCheckpoint> checkpoint = std::make_shared<ReconnectCheckpoint>();
     mutable std::mutex mutex;
     NetworkStatus status;
     Action action = Action::None;
@@ -111,6 +112,7 @@ struct NetworkRuntime::Impl {
     void PairedRound(const Identity& identity, const PairRecord& pair, LanListener& listener) {
         DWORD error = 0;
         SessionEndpoint endpoint = engine;
+        endpoint.checkpoint = checkpoint;
         endpoint.publish = [this](const SessionStatus& value) {
             { std::lock_guard<std::mutex> lock(mutex); status.session = value; }
             Publish(value.phase == SessionPhase::Active ? NetworkPhase::Active :
@@ -165,6 +167,7 @@ struct NetworkRuntime::Impl {
             }
             if (current == Action::Unpair) {
                 if (!RemovePair(pairPath,error)) { Publish(NetworkPhase::Error,error); return; }
+                *checkpoint = {};
             }
             PairRecord pair;
             const bool paired = LoadPair(pairPath,identity.Fingerprint(),pair,error);

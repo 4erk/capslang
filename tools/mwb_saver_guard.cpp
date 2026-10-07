@@ -71,7 +71,7 @@ int Watch(HANDLE parent, HANDLE mapping, HANDLE instance, HANDLE done) {
     CloseHandle(instance);
     return 0;
 }
-int Run(bool testStop, bool testCrash) {
+int Run(bool testStop, bool testCrash, HANDLE ownerStop = nullptr) {
     const auto mutexName = Name(L".instance"), eventName = Name(L".stop");
     if (mutexName.empty()) return 2;
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
@@ -116,6 +116,7 @@ int Run(bool testStop, bool testCrash) {
     Handle childProcess(child.hProcess), childThread(child.hThread);
     const ULONGLONG readyDeadline = GetTickCount64() + 5000;
     while (!InterlockedCompareExchange(&shared->ready, 0, 0)) {
+        if (ownerStop && WaitForSingleObject(ownerStop,0) == WAIT_OBJECT_0) { SetEvent(done.h); return ERROR_OPERATION_ABORTED; }
         if (GetTickCount64() >= readyDeadline || WaitForSingleObject(child.hProcess, 10) == WAIT_OBJECT_0) {
             SetEvent(done.h); return 10;
         }
@@ -127,13 +128,13 @@ int Run(bool testStop, bool testCrash) {
     HWND window = CreateWindowExW(0, cls.lpszClassName, L"", 0, 0, 0, 0, 0, nullptr, nullptr, cls.hInstance, nullptr);
     if (!window) { SetEvent(done.h); return 11; }
     const ULONGLONG started = GetTickCount64();
-    HANDLE events[]{stop.h, child.hProcess};
+    HANDLE events[]{stop.h, child.hProcess, ownerStop};
     DWORD exitCode = 0, lastError = 0;
     bool wasHeld = false;
     for (;;) {
-        const DWORD wait = MsgWaitForMultipleObjects(2, events, FALSE, 500, QS_ALLINPUT);
-        if (wait == WAIT_OBJECT_0 || wait == WAIT_OBJECT_0 + 1 || wait == WAIT_FAILED) {
-            if (wait != WAIT_OBJECT_0) exitCode = 12;
+        const DWORD wait = MsgWaitForMultipleObjects(ownerStop ? 3 : 2, events, FALSE, 500, QS_ALLINPUT);
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_OBJECT_0 + 1 || (ownerStop && wait == WAIT_OBJECT_0 + 2) || wait == WAIT_FAILED) {
+            if (wait == WAIT_OBJECT_0 + 1 || wait == WAIT_FAILED) exitCode = 12;
             break;
         }
         MSG message{};

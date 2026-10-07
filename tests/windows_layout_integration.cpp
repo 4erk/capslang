@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #ifdef CAPSLANG_PROFILE_ENGINE
+#include <atomic>
 #include "../src/runtime/engine.hpp"
 #include <mutex>
 #endif
@@ -973,6 +974,46 @@ void MessageObservationTests(const std::wstring& desktop, bool interactive = fal
         }, 4000), "returning focus reapplies shared EN, remembered RU is not a user choice");
         engine.Stop();
         SelectProfileFixture({});
+        // Exercise the engine's privileged-bridge control path with the real
+        // module transport. This fixture is user-owned; it does not claim a
+        // SYSTEM boundary test (that has a separate live diagnostic).
+        std::unique_ptr<ProfileAttachment> bridge;
+        std::atomic<unsigned> bridgeCalls{0}, bridgeReleases{0};
+        EngineOptions bridgeOptions;
+        bridgeOptions.capture = CaptureProfileFixture;
+        bridgeOptions.profileModule = L"not-an-allowed-fixture-module.dll";
+        bridgeOptions.systemProfile = [&](const LayoutTarget& current, LANGID language, std::uint64_t generation) {
+            ++bridgeCalls;
+            if (!bridge) {
+                bridge = std::make_unique<ProfileAttachment>(current.processId, current.threadId);
+                if (!bridge->Start(productionModule)) {
+                    ProfileHost::Sample result; result.error = bridge->Error(); bridge.reset(); return result;
+                }
+            }
+            bridge->Request(language, generation);
+            return bridge->Take();
+        };
+        bridgeOptions.releaseSystemProfile = [&] { bridge.reset(); ++bridgeReleases; };
+        SelectProfileFixture(target);
+        Engine bridgeEngine(bridgeOptions);
+        Check(bridgeEngine.Start(), "engine privileged-bridge fixture starts");
+        const auto bridgeApplied = [&](core::Language language) {
+            const auto state = bridgeEngine.Status();
+            return state.target == language && state.actual == language && state.profileConfirmed &&
+                state.apply == core::ApplyState::Applied;
+        };
+        Check(bridgeEngine.SetTarget(core::Language::Russian) && PumpUntil([&] {
+            return bridgeCalls.load() && bridgeApplied(core::Language::Russian);
+        }, 4000), "engine bridge confirms a real target read, not mere delivery");
+        const auto bridgeRevision = bridgeEngine.Status().userRevision;
+        Check(PostMessageW(target.focus, kHostSelectLanguage, kEnglish, 0) && PumpUntil([&] {
+            return bridgeApplied(core::Language::English) && bridgeEngine.Status().userRevision == bridgeRevision + 1;
+        }, 4000), "engine bridge adopts a manual event with a new generation");
+        SelectProfileFixture({});
+        Check(PumpUntil([&] {
+            return bridgeReleases.load() && !bridgeEngine.Status().profileConfirmed;
+        }), "missing target releases privileged binding and revokes confirmation");
+        bridgeEngine.Stop();
 #endif
     }
     // End the owned child before unloading the module/mapping: no callback can
@@ -980,6 +1021,48 @@ void MessageObservationTests(const std::wstring& desktop, bool interactive = fal
     SetEvent(fixture.stop);
     Check(WaitForSingleObject(fixture.process, 2000) == WAIT_OBJECT_0, "observed fixture exits cleanly");
     UnmapViewOfFile(data); CloseHandle(mapping); FreeLibrary(module);
+    if (!interactive) {
+        Fixture cold;
+        if (!cold.Start(desktop)) { Check(false, "cold host fixture starts"); return; }
+        Fixture passive;
+        if (!passive.Start(desktop)) { Check(false, "passive desktop fixture starts"); return; }
+        const auto target = cold.Target();
+        const auto productionModule = path.substr(0, path.find_last_of(L'\\')) + L"\\profile_module_test.dll";
+        ProfileAttachment attachment(cold.data->pid, cold.data->tid);
+        Check(attachment.Start(productionModule) && attachment.Request(kRussian, 1) && PumpUntil([&] {
+            const auto state = attachment.Take();
+            return state.confirmed && state.report.actual == kRussian && state.report.profile == kRussian;
+        }, 4000), "module initializes a balanced client in a cold host without explicit COM/TSF setup");
+        // An inactive window on the SAME desktop may retain its thread HKL.
+        // The requirement is each device's active input and native indicator,
+        // not rewriting every inactive application's remembered state. Keep
+        // this observation explicit; it is not native-indicator acceptance.
+        const bool passiveChanged = PumpUntil([&] { return TargetLanguage(passive.Target()) == kRussian; }, 2000);
+        std::printf("Desktop scope diagnostic (not native indicator acceptance): inactive_window_changed=%d hkl=%04x\n",
+            passiveChanged, TargetLanguage(passive.Target()));
+        bool external = false;
+        ProfileHost::Sample coldSample{};
+        InterlockedExchange(&cold.data->tsfResult, E_PENDING);
+        Check(PostMessageW(target.focus, kHostSelectLanguage, kEnglish, 0) && PumpUntil([&] {
+            const auto state = attachment.Take();
+            coldSample = state;
+            for (std::size_t i = 0; i < state.count; ++i)
+                if (state.events[i].cause == profile_channel::Cause::Observed && state.events[i].language == kEnglish)
+                    external = true;
+            return external && cold.data->tsfResult == S_OK && state.report.actual == kEnglish && !state.confirmed;
+        }, 4000), "cold host external language choice is observed and revokes confirmation");
+        std::printf("Cold host external choice: hr=0x%08lx observed=%d actual=%04x profile=%04x confirmed=%d error=%lu\n",
+            cold.data->tsfResult, external, coldSample.report.actual, coldSample.report.profile,
+            coldSample.confirmed, coldSample.error);
+        attachment.Stop();
+        ProfileAttachment replacement(cold.data->pid, cold.data->tid);
+        Check(replacement.Start(productionModule) && replacement.Request(kRussian, 1) && PumpUntil([&] {
+            return replacement.Take().confirmed;
+        }, 4000), "owned cold-host TSF client detaches and replacement owner can bind again");
+        replacement.Stop();
+        SetEvent(cold.stop);
+        Check(WaitForSingleObject(cold.process, 2000) == WAIT_OBJECT_0, "cold host fixture exits cleanly");
+    }
 }
 #endif
 
@@ -1439,6 +1522,40 @@ void EngineTests(const std::wstring& desktop) {
         Check(!verified.Status().profileConfirmed && verified.Status().apply != ApplyState::Applied,
               "late old profile success cannot acknowledge a newer choice");
         verified.Stop();
+    }
+    {
+        std::atomic<unsigned> pending{0}; std::atomic<DWORD> error{0};
+        EngineOptions options{CaptureFixture};
+        options.systemCaps = [&] {
+            EngineOptions::CapsBatch batch; batch.error = error.load(); batch.heartbeat = GetTickCount64();
+            batch.count = pending.exchange(0);
+            LARGE_INTEGER stamp{}; QueryPerformanceCounter(&stamp);
+            for (unsigned i = 0; i < batch.count && i < 8; ++i) batch.stamps[i] = static_cast<std::uint64_t>(stamp.QuadPart)+i;
+            return batch;
+        };
+        Engine caps(options);
+        Check(caps.Start(), "single SYSTEM Caps owner adapter starts on isolated desktop");
+        Check(caps.SetTarget(Language::English) && PumpUntil([&] { return caps.Status().actual == Language::English; }),
+            "SYSTEM Caps adapter fixture begins in English");
+        pending = 3;
+        Check(PumpUntil([&] { return caps.Status().userRevision == 3 && caps.Status().actual == Language::Russian; }),
+            "three queued SYSTEM Caps intents apply once each without requiring window clicks");
+        PumpUntil([] { return false; },100);
+        Check(caps.Status().userRevision == 3, "polling does not manufacture a duplicate SYSTEM Caps toggle");
+        pending = 2;
+        Check(PumpUntil([&] { return caps.Status().userRevision == 5 && caps.Status().actual == Language::Russian; }),
+            "rapid paired SYSTEM intents preserve parity and explicit-choice revisions");
+        error = ERROR_ACCESS_DENIED;
+        Check(PumpUntil([&] { return caps.Status().hookError == ERROR_ACCESS_DENIED && !caps.Status().hookRegistered; }),
+            "SYSTEM Caps failure is visible, not a healthy local hook substitute");
+        error = 0;
+        Check(PumpUntil([&] { return caps.Status().hookRegistered && caps.Status().hookThreadResponsive; }),
+            "SYSTEM Caps readiness recovers without a new language choice");
+        caps.Stop();
+        auto endpoint = ipc::Endpoint::Current(L"caps-startup-"+std::to_wstring(GetTickCount64()));
+        EngineHost host(endpoint,options);
+        Check(host.Start(), "SYSTEM Caps lease is initialized before EngineHost readiness validation");
+        host.Stop();
     }
     capturedWindow = nullptr;
 }

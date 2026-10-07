@@ -1,6 +1,7 @@
 #pragma once
 #include "../platform/windows_support.hpp"
 #include "../core/layout.hpp"
+#include "profile_host.hpp"
 #include <memory>
 #include <functional>
 
@@ -22,6 +23,12 @@ struct EngineStatus {
     bool targetThreadProfile = false;
 };
 struct EngineOptions {
+    struct CapsBatch {
+        DWORD error = ERROR_NOT_READY;
+        std::uint64_t heartbeat = 0, recoveries = 0;
+        unsigned count = 0;
+        std::uint64_t stamps[8]{};
+    };
     // Test dependency supplied by code, not by CLI or IPC. Default uses the
     // foreground target. It cannot be set by a lower-privileged external client.
     LayoutTarget (*capture)() = CaptureLayoutTarget;
@@ -32,6 +39,11 @@ struct EngineOptions {
     // Selected by trusted startup code from this EXE's embedded bundle.
     // Empty retains the legacy diagnostic engine, not an automatic fallback.
     std::wstring profileModule{};
+    std::function<ProfileHost::Sample(const LayoutTarget&, LANGID, std::uint64_t)> systemProfile{};
+    std::function<void()> releaseSystemProfile{};
+    // Trusted installed startup selects the sole SYSTEM CapsLock owner. This
+    // is never selectable by peer messages or lower-privileged clients.
+    std::function<CapsBatch()> systemCaps{};
 };
 
 class Engine {

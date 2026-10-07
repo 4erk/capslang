@@ -60,6 +60,9 @@ struct Endpoint {
     ProcessIdentity clientProcess{}, serverProcess{};
     static Endpoint Current(const std::wstring& instance = L"1.1");
 };
+// Preflight for a local module target using its already-open process handle.
+// Same user/session and optional incarnation pins; never a claimed wire PID.
+bool ProcessAllowed(HANDLE process, const Endpoint& endpoint);
 // Fixed-size local messages share authentication, limits and cancellation.
 // Each protocol MUST validate its own magic/version/operations in the handler.
 // Never use this as arbitrary file, command or input forwarding.
@@ -73,6 +76,9 @@ public:
     bool Start();
     void Stop();
     DWORD Error() const;
+    // Valid only inside this thread's authenticated handler. Kernel identity,
+    // never a PID supplied in the request. Cleared before/after every handler.
+    static ProcessIdentity Caller();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

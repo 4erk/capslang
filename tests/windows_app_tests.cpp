@@ -7,9 +7,11 @@
 #include "../src/app/tasks.hpp"
 #include "../src/platform/private_store.hpp"
 #include "../src/runtime/system_layout.hpp"
+#include "../src/runtime/system_caps.hpp"
 #include <atomic>
 #include <bcrypt.h>
 #include <cstdio>
+#include <sddl.h>
 
 using namespace capslang;
 using namespace capslang::app;
@@ -211,6 +213,41 @@ void InstallationRecords() {
 }
 void SystemBoundary() {
     const auto current = ipc::Endpoint::Current();
+    const auto capsEndpoint = system_caps::Endpoint(current.sid,current.session);
+    Check(capsEndpoint.sid == current.sid && capsEndpoint.serverSid == L"S-1-5-18" &&
+        capsEndpoint.session == current.session, "Caps channel pins the installation owner and SYSTEM session");
+    if (!system_layout::IsSystem()) {
+        system_caps::Server caps(current.sid,current.session,[]{return true;});
+        Check(!caps.Start(), "user/elevated application cannot start the SYSTEM Caps role");
+    }
+    for (const bool token : {false, true}) {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        DWORD securityError = 0;
+        Check(system_layout::WorkerQuerySecurity(current.sid, token, descriptor, securityError) && !securityError,
+            "worker object descriptor grants explicit installation-owner query access");
+        if (descriptor) {
+            PACL acl = nullptr; BOOL present = FALSE, defaulted = FALSE;
+            Check(GetSecurityDescriptorDacl(descriptor, &present, &acl, &defaulted) && present && acl && acl->AceCount == 2,
+                "worker object has only SYSTEM and owner ACEs, not world/admin grants");
+            if (acl && acl->AceCount == 2) {
+                PSID owner = nullptr; ConvertStringSidToSidW(current.sid.c_str(), &owner);
+                void* raw = nullptr;
+                const bool got = GetAce(acl, 1, &raw) != FALSE;
+                const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw);
+                const DWORD expected = token ? TOKEN_QUERY : PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+                Check(got && owner && ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE &&
+                    ace->Header.AceFlags == 0 && ace->Mask == expected && EqualSid(owner, const_cast<DWORD*>(&ace->SidStart)),
+                    "owner can query identity only: no memory, duplication, termination or token adjustment");
+                if (owner) LocalFree(owner);
+            }
+            LocalFree(descriptor);
+        }
+        descriptor = nullptr;
+        Check(!system_layout::WorkerQuerySecurity(L"S-1-5-18", token, descriptor, securityError) && !descriptor,
+            "worker query owner cannot be SYSTEM");
+        Check(!system_layout::WorkerQuerySecurity(L"invalid", token, descriptor, securityError) && !descriptor,
+            "worker query owner must be a valid SID");
+    }
     const auto endpoint = system_layout::Endpoint(current.sid, current.session);
     Check(!endpoint.error && endpoint.sid == current.sid && endpoint.serverSid == L"S-1-5-18" &&
         endpoint.session == current.session, "SYSTEM endpoint separates server from allowed user identity");

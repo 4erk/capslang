@@ -48,10 +48,23 @@ bool BadLength(const Endpoint& endpoint, DWORD length) {
 int main() {
     const auto endpoint = Endpoint::Current(L"test-" + std::to_wstring(GetCurrentProcessId()));
     Check(!endpoint.error && !endpoint.name.empty(), "SID/session-specific endpoint");
+    Check(ProcessAllowed(GetCurrentProcess(), endpoint), "module target preflight accepts own user and session");
+    auto otherTarget = endpoint; otherTarget.sid = L"S-1-5-19";
+    Check(!ProcessAllowed(GetCurrentProcess(), otherTarget), "module target preflight rejects another account before attaching");
+    otherTarget = endpoint; ++otherTarget.session;
+    Check(!ProcessAllowed(GetCurrentProcess(), otherTarget), "module target preflight rejects another session");
+    otherTarget = endpoint; otherTarget.clientProcess.id = GetCurrentProcessId();
+    Check(!ProcessAllowed(GetCurrentProcess(), otherTarget), "module target preflight rejects partial incarnation pin");
+    Check(!ProcessAllowed(nullptr, endpoint), "module target preflight fails closed for missing process handle");
     Check(Endpoint::Current(L"../invalid").error == ERROR_INVALID_PARAMETER, "endpoint traversal refused");
     std::atomic<unsigned> calls{0};
+    std::atomic<bool> callerMatched{true};
     auto handle = [&](const Request& request) {
         ++calls;
+        ProcessIdentity own;
+        const auto caller = MessageServer::Caller();
+        if (!IdentifyProcess(GetCurrentProcess(), own) || caller.id != own.id || caller.created != own.created)
+            callerMatched = false;
         Response response{};
         response.target = request.operation == Operation::SetLayout ? request.language : kEnglish;
         return response;
@@ -71,6 +84,9 @@ int main() {
         Check(Call(endpoint, path, false, request, response, error) && !response.error &&
             response.target == kEnglish && response.id == request.id, "real request/response with identity validation");
     }
+    Check(callerMatched, "handler receives authenticated kernel client incarnation");
+    Check(!MessageServer::Caller().id && !MessageServer::Caller().created,
+          "caller identity is not exposed outside handler thread scope");
     ProcessIdentity discovered, expected;
     Check(IdentifyProcess(GetCurrentProcess(), expected) &&
         Exchange(endpoint, path, false, &request, sizeof(request), &response, sizeof(response), error, &discovered) &&

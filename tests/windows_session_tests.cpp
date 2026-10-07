@@ -21,6 +21,7 @@ struct Model {
     ULONGLONG at = GetTickCount64(), due = 0;
     bool refuse = false;
     unsigned queued = 0;
+    std::shared_ptr<ReconnectCheckpoint> checkpoint = std::make_shared<ReconnectCheckpoint>();
     Model(core::Language language, unsigned age) {
         state = {{1, 0, 1, language, {age, age, true}, true}, language, core::ApplyState::Applied, false};
     }
@@ -47,7 +48,8 @@ struct Model {
                 state.apply = state.locked ? core::ApplyState::Locked : core::ApplyState::Pending;
                 due = GetTickCount64() + 200; return true;
             },
-            [this](const SessionStatus& value) { std::lock_guard<std::mutex> lock(mutex); status = value; }
+            [this](const SessionStatus& value) { std::lock_guard<std::mutex> lock(mutex); status = value; },
+            checkpoint
         };
     }
     void Manual(core::Language language) {
@@ -159,12 +161,36 @@ void Ambiguous(const Identity& server, const Identity& client) {
     Check(Until([&] { return coordinator.Status().phase == SessionPhase::Ended; }), "engine incarnation change ends old session");
     connection.Stop();
 }
+void RememberedCommonState(const Identity& server, const Identity& client) {
+    Model coordinator(core::Language::English, 10000), follower(core::Language::English, 10000);
+    {
+        Connection initial;
+        Check(initial.Start(server, client, coordinator, follower), "common-state TLS connection starts");
+        Check(Until([&] { return Applied(coordinator, follower, core::Language::English); }),
+              "both fresh application acknowledgements establish a common baseline");
+        initial.Stop();
+    }
+    Check(coordinator.checkpoint->localBaseline.engineEpoch == 1 &&
+          coordinator.checkpoint->peerBaseline.engineEpoch == 1,
+          "last common baseline survives disconnection in ordinary worker memory");
+    follower.Manual(core::Language::Russian);
+    { std::lock_guard<std::mutex> lock(coordinator.mutex); coordinator.state.snapshot.activity = {}; }
+    {
+        Connection resumed;
+        Check(resumed.Start(server, client, coordinator, follower), "TLS reconnect after offline explicit change starts");
+        Check(Until([&] { return Applied(coordinator, follower, core::Language::Russian); }),
+              "offline explicit choice wins relative to common baseline even when other age is unknown");
+        Check(coordinator.Read().snapshot.userRevision == 0 && follower.Read().snapshot.userRevision == 1,
+              "reconnect propagation preserves the genuine user revisions");
+        resumed.Stop();
+    }
+}
 }
 int main() {
     Winsock winsock; if (winsock.Error()) return 2;
     Identity server, client; DWORD error = 0;
     if (!server.Generate(error) || !client.Generate(error)) return 3;
-    Online(server, client); Ambiguous(server, client);
+    Online(server, client); Ambiguous(server, client); RememberedCommonState(server, client);
     std::printf("Windows broker session: %u checks, %u failures; real TLS, model endpoints, no input desktop changes.\n", checks, failures);
     return failures ? 1 : 0;
 }

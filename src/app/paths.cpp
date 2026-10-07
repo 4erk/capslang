@@ -125,7 +125,11 @@ std::wstring InstalledExecutable(DWORD &error) {
 #else
     const auto root = Folder(FOLDERID_ProgramFiles, error);
 #endif
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+    return root.empty() ? std::wstring{} : root + L"\\CapsLangDevProbe\\CapsLang.exe";
+#else
     return root.empty() ? std::wstring{} : root + L"\\CapsLang\\CapsLang.exe";
+#endif
 }
 bool ProtectedExecutable(const std::wstring &path, DWORD &error) {
     const auto expected = InstalledExecutable(error);

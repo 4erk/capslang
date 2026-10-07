@@ -1,15 +1,66 @@
 #include "system_layout.hpp"
+#include "system_profile.hpp"
+#include "probe_trace.hpp"
+#include "system_caps.hpp"
 #include "../app/paths.hpp"
 #include "../app/install_store.hpp"
 #include <sddl.h>
 #include <wtsapi32.h>
 #include <objbase.h>
 #include <atomic>
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+#include <thread>
+#endif
 
 namespace capslang::system_layout {
 namespace {
 constexpr wchar_t kService[] = L"CapsLangLayout";
 constexpr wchar_t kDescription[] = L"CapsLang local layout access v1; no networking";
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+// Passive diagnostic only. A dedicated message loop observes Caps delivery at
+// SYSTEM integrity, never suppresses or synthesizes input, and performs no I/O.
+class ProbeCapsObserver {
+    static thread_local ProbeCapsCounters* current;
+    std::atomic<DWORD> threadId{0};
+    HANDLE ready = nullptr;
+    std::thread thread;
+    static LRESULT CALLBACK Hook(int code, WPARAM message, LPARAM pointer) {
+        const auto next = CallNextHookEx(nullptr,code,message,pointer);
+        if (code == HC_ACTION && current) {
+            const auto& data = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(pointer);
+            if (data.vkCode == VK_CAPITAL)
+                current->Observe(message == WM_KEYDOWN || message == WM_SYSKEYDOWN,
+                    (data.flags & LLKHF_INJECTED) != 0,next != 0);
+        }
+        return next;
+    }
+public:
+    ProbeCapsCounters counters;
+    ProbeCapsObserver() {
+        ready = CreateEventW(nullptr,TRUE,FALSE,nullptr);
+        if (!ready) return;
+        thread = std::thread([this] {
+            MSG message{}; PeekMessageW(&message,nullptr,0,0,PM_NOREMOVE);
+            threadId = GetCurrentThreadId(); current = &counters;
+            const auto hook = SetWindowsHookExW(WH_KEYBOARD_LL,Hook,GetModuleHandleW(nullptr),0);
+            SetEvent(ready);
+            if (hook) {
+                while (GetMessageW(&message,nullptr,0,0) > 0) {
+                    TranslateMessage(&message); DispatchMessageW(&message);
+                }
+                UnhookWindowsHookEx(hook);
+            }
+            current = nullptr;
+        });
+        WaitForSingleObject(ready,5000);
+    }
+    ~ProbeCapsObserver() {
+        if (thread.joinable()) { PostThreadMessageW(threadId.load(),WM_QUIT,0,0); thread.join(); }
+        if (ready) CloseHandle(ready);
+    }
+};
+thread_local ProbeCapsCounters* ProbeCapsObserver::current = nullptr;
+#endif
 struct Handle {
     HANDLE h = nullptr;
     ~Handle() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
@@ -194,14 +245,24 @@ DWORD WINAPI Control(DWORD code, DWORD, void*, void*) {
 }
 bool Spawn(DWORD session, HANDLE job, HANDLE& process) {
     Handle own, token;
+    struct Descriptor {
+        PSECURITY_DESCRIPTOR value = nullptr;
+        ~Descriptor() { if (value) LocalFree(value); }
+    } tokenDescriptor, processDescriptor;
+    DWORD error = 0;
+    const auto owner = Owner();
+    if (owner.empty() || !WorkerQuerySecurity(owner, true, tokenDescriptor.value, error) ||
+        !WorkerQuerySecurity(owner, false, processDescriptor.value, error)) { SetLastError(error ? error : ERROR_INVALID_SID); return false; }
+    SECURITY_ATTRIBUTES tokenAttributes{sizeof(SECURITY_ATTRIBUTES), tokenDescriptor.value, FALSE};
+    SECURITY_ATTRIBUTES processAttributes{sizeof(SECURITY_ATTRIBUTES), processDescriptor.value, FALSE};
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY, &own.h) ||
-        !DuplicateTokenEx(own.h, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &token.h) ||
+        !DuplicateTokenEx(own.h, MAXIMUM_ALLOWED, &tokenAttributes, SecurityImpersonation, TokenPrimary, &token.h) ||
         !SetTokenInformation(token.h, TokenSessionId, &session, sizeof(session))) return false;
     const auto exe = app::ExecutablePath();
     auto command = L"\"" + exe + L"\" --layout-worker";
     STARTUPINFOW startup{}; startup.cb = sizeof(startup); wchar_t desktop[] = L"winsta0\\default"; startup.lpDesktop = desktop;
     PROCESS_INFORMATION child{};
-    if (!CreateProcessAsUserW(token.h, exe.c_str(), command.data(), nullptr, nullptr, FALSE,
+    if (!CreateProcessAsUserW(token.h, exe.c_str(), command.data(), &processAttributes, nullptr, FALSE,
         CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &child)) return false;
     const bool assigned = AssignProcessToJobObject(job, child.hProcess) && ResumeThread(child.hThread) != DWORD(-1);
     if (!assigned) { TerminateProcess(child.hProcess, ERROR_PROCESS_ABORTED); CloseHandle(child.hProcess); }
@@ -246,6 +307,44 @@ void WINAPI RunService(DWORD, LPWSTR*) {
 } // namespace
 
 bool IsSystem() { Handle token; return OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.h) && Sid(token.h) == L"S-1-5-18"; }
+bool WorkerQuerySecurity(const std::wstring& owner, bool token, PSECURITY_DESCRIPTOR& descriptor, DWORD& error) {
+    descriptor = nullptr; error = ERROR_INVALID_SID;
+    PSID sid = nullptr;
+    if (owner.empty() || owner.find(L'\0') != std::wstring::npos ||
+        !ConvertStringSidToSidW(owner.c_str(), &sid)) return false;
+    const bool valid = IsValidSid(sid) && !IsWellKnownSid(sid, WinLocalSystemSid);
+    LocalFree(sid);
+    if (!valid) return false;
+    static_assert(TOKEN_QUERY == 0x8 && (PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE) == 0x101000,
+        "read-only owner masks");
+    const std::wstring sddl = token ?
+        L"D:P(A;;0x000F01FF;;;SY)(A;;0x00000008;;;" + owner + L")" :
+        L"D:P(A;;0x001FFFFF;;;SY)(A;;0x00101000;;;" + owner + L")";
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
+        error = GetLastError(); return false;
+    }
+    error = 0; return true;
+}
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+DWORD ProbeWorker() {
+    DWORD error = 0;
+    if (!IsSystem() || !app::ProtectedExecutable(app::ExecutablePath(), error)) return ERROR_ACCESS_DENIED;
+    const DWORD session = WTSGetActiveConsoleSessionId();
+    if (!session || session == 0xffffffff || SessionUser(session) != Owner() ||
+        !Privilege(SE_TCB_NAME) || !Privilege(SE_ASSIGNPRIMARYTOKEN_NAME) || !Privilege(SE_INCREASE_QUOTA_NAME))
+        return ERROR_ACCESS_DENIED;
+    Handle job; job.h = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    Handle child;
+    if (!job.h || !SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
+        !Spawn(session, job.h, child.h)) return GetLastError();
+    const auto result = WaitForSingleObject(child.h, 300000);
+    if (result == WAIT_TIMEOUT) return 0; // Closing the owned job stops only this worker.
+    DWORD code = ERROR_GEN_FAILURE;
+    return result == WAIT_OBJECT_0 && GetExitCodeProcess(child.h, &code) ? code : GetLastError();
+}
+#endif
 ipc::Endpoint Endpoint(const std::wstring& userSid, DWORD session) {
     ipc::Endpoint result; PSID sid = nullptr;
     if (!session || session == 0xffffffff || userSid.find(L'\0') != std::wstring::npos ||
@@ -284,14 +383,30 @@ DWORD WorkerMain() {
         const auto result = Execute(request, session, owner); memcpy(output, &result, sizeof(result));
     });
     if (!server.Start()) return server.Error();
+    system_profile::Server profiles(owner, session, [&] {
+        return SessionUser(session) == owner && NormalDesktop(session);
+    });
+    if (!profiles.Start()) { server.Stop(); return profiles.Error(); }
+    system_caps::Server caps(owner,session,[&] { return SessionUser(session) == owner && NormalDesktop(session); });
+    if (!caps.Start()) { profiles.Stop(); server.Stop(); return ERROR_NOT_READY; }
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+    ProbeCapsObserver capsProbe;
+#endif
     while (WTSGetActiveConsoleSessionId() == session && SessionUser(session) == owner) {
         const auto started = executing.load();
         // TSF is external COM code and can block. Sacrifice only this owned
         // stateless worker; the service recreates it, never the user's window.
         if (started && GetTickCount64() - started >= 2000) TerminateProcess(GetCurrentProcess(), ERROR_TIMEOUT);
+        const auto profileStarted = profiles.BusySince();
+        if (profileStarted && GetTickCount64() - profileStarted >= 2000) TerminateProcess(GetCurrentProcess(), ERROR_TIMEOUT);
+        profiles.CheckOwner();
+        caps.Step();
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+        capsProbe.counters.Flush("system-passive");
+#endif
         Sleep(100);
     }
-    server.Stop(); return 0;
+    caps.Stop(); profiles.Stop(); server.Stop(); return 0;
 }
 DWORD ServiceMain() {
     DWORD error = 0;

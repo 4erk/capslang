@@ -53,6 +53,17 @@ int main() {
     Check(sample.count == 2 && sample.events[0].cause == pc::Cause::Baseline &&
         sample.events[1].cause == pc::Cause::Observed, "host preserves origin, does not invent manual intent");
     ++report.poll; Check(exchange() && host.Take().count == 0, "lost reply/redelivery does not replay events");
+    report.error = ERROR_ACCESS_DENIED;
+    report.count = 1; report.events = {};
+    report.events[0] = {3, 0, 0x409, pc::Cause::Observed, 3};
+    ++report.poll;
+    Check(exchange() && reply.eventsThrough == 3, "manual notification acknowledged despite failed UI measurement");
+    sample = host.Take();
+    Check(sample.error == ERROR_ACCESS_DENIED && !sample.confirmed && sample.count == 1 &&
+          sample.events[0].serial == 3 && sample.events[0].language == 0x409,
+          "failed measurement retains authenticated manual intent without claiming application");
+    Check(host.Take().count == 0, "failed-measurement notification consumed exactly once");
+    report.error = 0;
     report.count = 0; report.events = {}; report.confirmedGeneration = 4;
     ++report.poll; Check(exchange() && host.Take().confirmed, "fresh module sample restores valid confirmation");
     Sleep(1010);

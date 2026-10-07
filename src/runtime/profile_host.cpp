@@ -79,6 +79,11 @@ bool ProfileHost::Start() {
         !ipc::IdentifyProcess(GetCurrentProcess(), self.endpoint.serverProcess)) {
         self.error = ERROR_INVALID_DATA; return false;
     }
+    // Reject another account (including SYSTEM) before the caller installs a
+    // hook in it, not only when the module later fails pipe authentication.
+    if (!ipc::ProcessAllowed(self.target, self.endpoint)) {
+        self.error = ERROR_ACCESS_DENIED; return false;
+    }
     self.command.binding = self.binding; self.command.command = 1;
     self.server = std::make_unique<ipc::MessageServer>(self.endpoint, sizeof(pc::Report), sizeof(pc::Command),
         [&self](const void* in, void* out) { self.Handle(in, out); });

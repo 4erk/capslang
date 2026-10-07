@@ -9,17 +9,18 @@ param(
     [switch]$AppDevOnly,
     [switch]$SaverGuardOnly,
     [switch]$RecipientProbeOnly,
-    [switch]$MessageProbeOnly
+    [switch]$MessageProbeOnly,
+    [switch]$SystemProfileProbeOnly
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $NetworkTestsOnly, $AppDevOnly, $SaverGuardOnly, $RecipientProbeOnly, $MessageProbeOnly) | Where-Object { $_ }).Count -gt 1) {
+if (@(@($ProbeOnly, $IntegrationOnly, $RuntimeTestsOnly, $NetworkTestsOnly, $AppDevOnly, $SaverGuardOnly, $RecipientProbeOnly, $MessageProbeOnly, $SystemProfileProbeOnly) | Where-Object { $_ }).Count -gt 1) {
     throw 'Choose only one development build mode.'
 }
 if ($NetworkTestsOnly) { $RuntimeTestsOnly = $true }
-$Release = -not ($ProbeOnly -or $IntegrationOnly -or $RuntimeTestsOnly -or $AppDevOnly -or $SaverGuardOnly -or $RecipientProbeOnly -or $MessageProbeOnly)
+$Release = -not ($ProbeOnly -or $IntegrationOnly -or $RuntimeTestsOnly -or $AppDevOnly -or $SaverGuardOnly -or $RecipientProbeOnly -or $MessageProbeOnly -or $SystemProfileProbeOnly)
 # Some WSL hosts inherit PATHEXT=.CPL. PowerShell then fails to wait for .exe
 # invocations or set LASTEXITCODE. Repair only this build process, and restore
 # the caller's environment even on failure or an early return.
@@ -175,14 +176,16 @@ if ($MessageProbeOnly) {
     return
 }
 
-if ($AppDevOnly -or $Release) {
+if ($AppDevOnly -or $Release -or $SystemProfileProbeOnly) {
     if ($Release -and -not $SkipTests) {
         & $PSCommandPath -RuntimeTestsOnly
     }
     $appDir = Join-Path $buildDir 'app-dev'
+    if ($SystemProfileProbeOnly) { $appDir = Join-Path $buildDir 'system-profile-probe' }
     New-Item -ItemType Directory -Force -Path $appDir | Out-Null
     $flags = @('-std=c++17', '-O2', '-DNDEBUG', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00',
         '-static', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-Wl,--no-insert-timestamp')
+    if ($SystemProfileProbeOnly) { $flags += '-DCAPSLANG_SYSTEM_PROFILE_PROBE' }
     $moduleResources = New-Object 'System.Collections.Generic.List[string]'
     foreach ($architecture in @('64','32')) {
         $moduleCompiler = if ($architecture -eq '32') {
@@ -208,7 +211,7 @@ if ($AppDevOnly -or $Release) {
     if ($LASTEXITCODE -ne 0) { throw 'Profile module resource compilation failed.' }
     $appSources = @('app\control.cpp','app\broker.cpp','app\paths.cpp','app\tasks.cpp',
         'app\install_store.cpp','app\installer.cpp','app\migration.cpp','app\firewall.cpp','app\profile_assets.cpp',
-        'runtime\local_ipc.cpp','runtime\system_layout.cpp','runtime\engine_client.cpp','platform\windows_support.cpp',
+        'runtime\local_ipc.cpp','runtime\system_layout.cpp','runtime\system_profile.cpp','runtime\engine_client.cpp','platform\windows_support.cpp',
         'runtime\profile_host.cpp','runtime\profile_attachment.cpp',
         'network\runtime.cpp','network\application_mode.cpp','network\paired_connection.cpp',
         'network\enrollment.cpp','network\session.cpp','network\lan.cpp',
@@ -216,7 +219,7 @@ if ($AppDevOnly -or $Release) {
         ForEach-Object { Join-Path $projectRoot ('src\' + $_) }
     $libs = @('-lole32','-loleaut32','-ltaskschd','-luuid','-luser32','-ladvapi32','-lsetupapi','-lshell32','-lcomctl32',
         '-lws2_32','-liphlpapi','-lsecur32','-lcrypt32','-lncrypt','-lbcrypt','-lversion','-lwtsapi32')
-    if (-not $SkipTests) {
+    if (-not $SkipTests -and -not $SystemProfileProbeOnly) {
         $appTest = Join-Path $appDir 'windows_app_tests.exe'
         & $compiler @flags (Join-Path $projectRoot 'tests\windows_app_tests.cpp') @appSources $modulesRes '-o' $appTest @libs
         if ($LASTEXITCODE -ne 0) { throw 'Application test compilation failed.' }

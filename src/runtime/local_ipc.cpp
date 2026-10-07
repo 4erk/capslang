@@ -5,6 +5,7 @@
 
 namespace capslang::ipc {
 namespace {
+thread_local ProcessIdentity callingProcess;
 std::wstring Sid(HANDLE token) {
     DWORD size = 0;
     GetTokenInformation(token, TokenUser, nullptr, 0, &size);
@@ -26,7 +27,8 @@ bool ProcessMatches(HANDLE process, const ProcessIdentity& expected) {
     ProcessIdentity actual;
     return IdentifyProcess(process, actual) && actual.id == expected.id && actual.created == expected.created;
 }
-bool ClientMatches(HANDLE pipe, const Endpoint& endpoint) {
+bool ClientMatches(HANDLE pipe, const Endpoint& endpoint, ProcessIdentity& identity) {
+    identity = {};
     if (!ImpersonateNamedPipeClient(pipe)) return false;
     HANDLE token = nullptr;
     const bool opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token) != FALSE;
@@ -38,16 +40,17 @@ bool ClientMatches(HANDLE pipe, const Endpoint& endpoint) {
     if (token) CloseHandle(token);
     // Never call the handler while impersonating even the allowed user.
     if (!RevertToSelf()) std::terminate();
-    if (match && (!endpoint.clientImage.empty() || endpoint.clientProcess.id)) {
+    if (match) {
         ULONG pid = 0;
         match = GetNamedPipeClientProcessId(pipe, &pid) != FALSE;
         HANDLE process = match ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
         wchar_t path[32768]{}; DWORD length = ARRAYSIZE(path);
-        match = process && ProcessMatches(process, endpoint.clientProcess) &&
+        match = process && ProcessMatches(process, endpoint.clientProcess) && IdentifyProcess(process, identity) &&
             (endpoint.clientImage.empty() || (QueryFullProcessImageNameW(process, 0, path, &length) &&
             _wcsicmp(path, endpoint.clientImage.c_str()) == 0));
         if (process) CloseHandle(process);
     }
+    if (!match) identity = {};
     return match;
 }
 bool ServerMatches(HANDLE pipe, const Endpoint& endpoint, const std::wstring& path, bool high, ProcessIdentity& identity) {
@@ -110,6 +113,15 @@ bool IdentifyProcess(HANDLE process, ProcessIdentity& identity) {
     const auto stamp = (std::uint64_t(created.dwHighDateTime) << 32) | created.dwLowDateTime;
     if (!stamp) return false;
     identity = {pid, stamp}; return true;
+}
+bool ProcessAllowed(HANDLE process, const Endpoint& endpoint) {
+    if (endpoint.error || endpoint.sid.empty() || !process ||
+        !ProcessMatches(process, endpoint.clientProcess)) return false;
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) return false;
+    const bool allowed = TokenMatches(token, endpoint);
+    CloseHandle(token);
+    return allowed;
 }
 bool Valid(const Request& request) {
     if (request.magic != kMagic || request.version != kVersion || !request.id) return false;
@@ -184,10 +196,12 @@ struct MessageServer::Impl {
             CloseHandle(connection.hEvent);
             if (success) {
                 std::vector<BYTE> request(self.requestBytes), response(self.responseBytes);
-                if (Transfer(pipe, request.data(), self.requestBytes, false, self.stop, error) && ClientMatches(pipe,self.endpoint)) {
+                callingProcess = {};
+                if (Transfer(pipe, request.data(), self.requestBytes, false, self.stop, error) && ClientMatches(pipe,self.endpoint,callingProcess)) {
                     bool handled = false;
                     try { self.handler(request.data(),response.data()); handled = true; }
                     catch (...) { /* Fail closed: no incomplete handler output. */ }
+                    callingProcess = {};
                     if (handled) Transfer(pipe, response.data(), self.responseBytes, true, self.stop, error);
                     // Wait for the client to finish reading by having it send a
                     // fixed acknowledgement. No unbounded FlushFileBuffers.
@@ -205,6 +219,7 @@ struct MessageServer::Impl {
 MessageServer::MessageServer(Endpoint endpoint, DWORD request, DWORD response, Handler handler)
     : impl_(std::make_unique<Impl>(std::move(endpoint),request,response,std::move(handler))) {}
 MessageServer::~MessageServer() { Stop(); }
+ProcessIdentity MessageServer::Caller() { return callingProcess; }
 bool MessageServer::Start() {
     auto& self = *impl_;
     if (self.thread) return self.listening;

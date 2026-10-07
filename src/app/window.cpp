@@ -54,8 +54,6 @@ struct Window {
     Broker &broker;
     std::wstring directory;
     HANDLE ownedEngineShutdown = nullptr;
-    bool maintainSaver = false;
-    ULONGLONG lastSaverCheck = 0;
     HWND hwnd = nullptr, status = nullptr, fingerprints = nullptr;
     std::uint64_t sequence = 1, ticket = 0;
     net::Pin pending{};
@@ -73,8 +71,7 @@ struct Window {
     void Create() {
         HMENU menu = CreateMenu(), actions = CreatePopupMenu();
         AppendMenuW(actions, MF_STRING, Install, L"Установить / обновить");
-        AppendMenuW(actions, MF_STRING, Rollback, L"Откат к CapsLang 1.0.0");
-        AppendMenuW(actions, MF_STRING, Legacy, L"Восстановить утилиту 2015 года");
+        AppendMenuW(actions, MF_STRING, Rollback, L"Откат к предыдущей установленной сборке");
         AppendMenuW(actions, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(actions, MF_STRING, Uninstall, L"Удалить CapsLang");
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(actions), L"Приложение");
@@ -122,20 +119,8 @@ struct Window {
             DestroyWindow(hwnd);
             return;
         }
-        if (maintainSaver && GetTickCount64() - lastSaverCheck >= 2000) {
-            lastSaverCheck = GetTickCount64();
-            const auto user = ipc::Endpoint::Current();
-            if (!user.error) {
-                const auto name = L"Local\\CapsLang.MwbSaverGuard." + user.sid + L".instance";
-                HANDLE guard = OpenMutexW(SYNCHRONIZE, FALSE, name.c_str());
-                if (guard)
-                    CloseHandle(guard);
-                else {
-                    DWORD error = 0;
-                    StartSelf(L"--saver-guard", error);
-                }
-            }
-        }
+        // The broker-owned saver thread retries its lease itself. The window
+        // must not spawn a competing standalone guard during lease handoff.
         if (!IsWindowVisible(hwnd))
             return;
         auto snapshot = broker.Snapshot(true);
@@ -158,7 +143,7 @@ struct Window {
         ControlRequest request;
         request.id = ++sequence;
         DWORD error = 0;
-        if (id == Install || id == Rollback || id == Legacy || id == Uninstall) {
+        if (id == Install || id == Rollback || id == Uninstall) {
             if (id != Install && MessageBoxW(hwnd,
                                              L"Остановить текущий CapsLang и выполнить выбранное "
                                              L"действие? Файлы прежних версий сохранятся.",
@@ -166,7 +151,6 @@ struct Window {
                 return;
             const auto *option = id == Install    ? L"--install"
                                  : id == Rollback ? L"--rollback"
-                                 : id == Legacy   ? L"--restore-legacy"
                                                   : L"--uninstall";
             if (!StartSelf(option, error))
                 Error(hwnd, error);
@@ -267,9 +251,8 @@ struct Window {
     }
 };
 } // namespace
-int RunWindow(Broker &broker, const std::wstring &directory, bool show, HANDLE ownedEngineShutdown,
-              bool maintainSaver) {
-    Window window{broker, directory, ownedEngineShutdown, maintainSaver};
+int RunWindow(Broker &broker, const std::wstring &directory, bool show, HANDLE ownedEngineShutdown) {
+    Window window{broker, directory, ownedEngineShutdown};
     WNDCLASSW cls{};
     cls.lpfnWndProc = Window::Proc;
     cls.hInstance = GetModuleHandleW(nullptr);
@@ -279,7 +262,7 @@ int RunWindow(Broker &broker, const std::wstring &directory, bool show, HANDLE o
     if (!RegisterClassW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         return static_cast<int>(GetLastError());
     HWND hwnd =
-        CreateWindowExW(0, cls.lpszClassName, L"CapsLang 1.1.0-dev.2",
+        CreateWindowExW(0, cls.lpszClassName, L"CapsLang 1.1.0-rc.2",
                         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT,
                         CW_USEDEFAULT, 800, 715, nullptr, nullptr, cls.hInstance, &window);
     if (!hwnd)

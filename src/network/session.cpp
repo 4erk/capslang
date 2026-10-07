@@ -105,7 +105,20 @@ private:
         if (!Send(Packet(ControlKind::Hello, &local.snapshot))) return false;
         Control reply;
         if (!Read(reply) || reply.kind != ControlKind::SampleReply) return Fail(error_ ? error_ : ERROR_INVALID_DATA);
-        const auto localBaseline = Mark(local.snapshot), peerBaseline = Mark(reply.first);
+        auto localBaseline = Mark(local.snapshot), peerBaseline = Mark(reply.first);
+        // A reconnect must compare against the last confirmed common state,
+        // not reset both choice counters to their already-changed values.
+        // Incarnation or pair changes invalidate remembered ordering.
+        if (endpoint_.checkpoint) {
+            const auto& saved = *endpoint_.checkpoint;
+            if (saved.local == localId_ && saved.peer == peerId_ &&
+                saved.localBaseline.engineEpoch == local.snapshot.engineEpoch &&
+                saved.peerBaseline.engineEpoch == reply.first.engineEpoch &&
+                saved.localBaseline.activitySerial <= local.snapshot.activitySerial &&
+                saved.peerBaseline.activitySerial <= reply.first.activitySerial) {
+                localBaseline = saved.localBaseline; peerBaseline = saved.peerBaseline;
+            }
+        }
         const auto localEpoch = local.snapshot.engineEpoch, peerEpoch = reply.first.engineEpoch;
         for (;;) {
             if (!ReadLocal(local)) return false;
@@ -186,7 +199,16 @@ private:
         if (packet.first.engineEpoch != peerEpoch_) return Fail(ERROR_REVISION_MISMATCH);
         if (packet.update && !broker_->Remote(*packet.update, local, GetTickCount64())) return Fail(ERROR_INVALID_DATA);
         if (packet.ack && !broker_->Remote(*packet.ack, local, GetTickCount64()) && !broker_->Ready()) return Fail(ERROR_INVALID_DATA);
-        return Collect(local);
+        if (!Collect(local)) return false;
+        // Never advance the common baseline on delivery, a stale ACK, lock,
+        // or a failed application. Both measurements must concern this target.
+        if (endpoint_.checkpoint && broker_->PeerApplied() == Applied::Yes &&
+            !local.locked && local.apply == core::ApplyState::Applied &&
+            local.actual == broker_->Target() && local.snapshot.language == broker_->Target() &&
+            packet.first.language == broker_->Target()) {
+            *endpoint_.checkpoint = {localId_, peerId_, Mark(local.snapshot), Mark(packet.first)};
+        }
+        return true;
     }
     bool SendUpdates(ControlKind kind, const LocalState& local) {
         auto packet = Packet(kind, &local.snapshot); packet.update = pendingUpdate_; packet.ack = pendingAck_;

@@ -21,6 +21,7 @@ public:
     bool Request(LANGID language, std::uint64_t generation);
     ProfileHost::Sample Take();
     DWORD Error() const;
+    std::uint64_t Binding() const { return host_.Binding(); }
 private:
     ProfileHost host_;
     DWORD process_, thread_, error_ = ERROR_NOT_READY;

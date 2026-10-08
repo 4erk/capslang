@@ -3,6 +3,7 @@
 #include <msctf.h>
 #include <inputscope.h>
 #include <vector>
+#include <algorithm>
 #include "../core/text_layout.hpp"
 namespace capslang {
 // Successful edit outcomes carry only resulting language, never selected text.
@@ -16,7 +17,6 @@ inline constexpr GUID kInputScopeInterface{0xfde1eaee,0x6924,0x4cdf,{0x91,0xe7,0
 // Executed only on the application's own foreground UI thread. No clipboard,
 // synthetic input, transport or logging of content.
 inline HRESULT ConvertClassicSelection(HWND focus, core::Language destination) {
-    (void)destination; // Direction is determined by the selection, not the keyboard.
     wchar_t name[64]{}; GetClassNameW(focus,name,64);
     if (_wcsicmp(name,L"Edit") != 0) return E_NOTIMPL;
     const auto style=GetWindowLongPtrW(focus,GWL_STYLE);
@@ -25,23 +25,46 @@ inline HRESULT ConvertClassicSelection(HWND focus, core::Language destination) {
     const int length=GetWindowTextLengthW(focus);
     if(start==end) return S_FALSE;
     if(length<0 || length>65536 || end>static_cast<DWORD>(length)) return HRESULT_FROM_WIN32(ERROR_MORE_DATA);
+    const auto limit=static_cast<ULONG_PTR>(SendMessageW(focus,EM_GETLIMITTEXT,0,0));
+    if(limit && static_cast<ULONG_PTR>(length)>limit)return HRESULT_FROM_WIN32(ERROR_MORE_DATA);
     std::vector<wchar_t> buffer(length+1);
     const auto count=GetWindowTextW(focus,buffer.data(),static_cast<int>(buffer.size()));
     if(count!=length) { SecureZeroMemory(buffer.data(),buffer.size()*sizeof(wchar_t)); return E_FAIL; }
     std::wstring replacement(buffer.data()+start,buffer.data()+end);
-    SecureZeroMemory(buffer.data(),buffer.size()*sizeof(wchar_t));
-    const auto resulting=core::InvertSelection(replacement.data(),replacement.size());
+    const auto resulting=core::InvertSelection(replacement.data(),replacement.size(),destination);
+    std::wstring expected(buffer.data(),static_cast<std::size_t>(length));
+    expected.replace(start,end-start,replacement);
     SendMessageW(focus,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(replacement.c_str()));
+    std::vector<wchar_t> observed(length+1);
+    const auto actualLength=GetWindowTextLengthW(focus);
+    const auto actualRead=GetWindowTextW(focus,observed.data(),static_cast<int>(observed.size()));
+    const bool sameLength=actualLength==length && actualRead==length;
+    const bool applied=sameLength && std::equal(expected.begin(),expected.end(),observed.begin());
+    const bool unchanged=sameLength && std::equal(buffer.begin(),buffer.end(),observed.begin());
+    // Do not undo a previous user action if this replacement was simply refused.
+    if(!applied && !unchanged) {
+        SendMessageW(focus,EM_UNDO,0,0);
+        const auto restoredRead=GetWindowTextW(focus,observed.data(),static_cast<int>(observed.size()));
+        const bool restored=GetWindowTextLengthW(focus)==length && restoredRead==length &&
+            std::equal(buffer.begin(),buffer.end(),observed.begin());
+        // Some bounded controls refuse undo insertion too. Restore the captured
+        // pre-edit snapshot synchronously on this same UI thread, never clipboard.
+        if(!restored)SetWindowTextW(focus,buffer.data());
+    }
     SendMessageW(focus,EM_SETSEL,start,end);
+    SecureZeroMemory(buffer.data(),buffer.size()*sizeof(wchar_t));
+    SecureZeroMemory(observed.data(),observed.size()*sizeof(wchar_t));
+    SecureZeroMemory(expected.data(),expected.size()*sizeof(wchar_t));
     SecureZeroMemory(replacement.data(),replacement.size()*sizeof(wchar_t));
-    return SelectionOutcome(resulting);
+    return applied?SelectionOutcome(resulting):HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
 }
 class SelectionEdit final : public ITfEditSession {
     ULONG refs=1;
     ITfContext* context;
+    core::Language fallback;
     HWND focus;
 public:
-    SelectionEdit(ITfContext* value,core::Language language,HWND window):context(value),focus(window) {(void)language;context->AddRef();}
+    SelectionEdit(ITfContext* value,core::Language language,HWND window):context(value),fallback(language),focus(window) {context->AddRef();}
     ~SelectionEdit(){context->Release();}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         if(!out) return E_POINTER; *out=nullptr;
@@ -74,7 +97,7 @@ public:
         hr=selection.range->GetText(cookie,0,buffer.data(),static_cast<ULONG>(buffer.size()),&read);
         if(FAILED(hr)||read==buffer.size()){SecureZeroMemory(buffer.data(),buffer.size()*sizeof(wchar_t));return FAILED(hr)?hr:HRESULT_FROM_WIN32(ERROR_MORE_DATA);}
         if(!read)return S_FALSE;
-        const auto resulting=core::InvertSelection(buffer.data(),read);
+        const auto resulting=core::InvertSelection(buffer.data(),read,fallback);
         hr=selection.range->SetText(cookie,0,buffer.data(),read);
         SecureZeroMemory(buffer.data(),buffer.size()*sizeof(wchar_t));
         if(SUCCEEDED(hr))hr=context->SetSelection(cookie,1,&selection);

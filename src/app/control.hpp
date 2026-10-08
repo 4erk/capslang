@@ -3,7 +3,7 @@
 #include "../runtime/local_ipc.hpp"
 
 namespace capslang::app {
-inline constexpr char kVersion[] = "1.1.0-rc.3";
+inline constexpr char kVersion[] = "1.1.0";
 constexpr std::uint32_t kControlMagic = 0x554c5043, kControlVersion = 1;
 enum class Command : std::uint32_t {
     Status = 1,

@@ -1638,9 +1638,26 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if(FindLayout(kEnglish) && FindLayout(kRussian)) {
+        const auto en=FindLayout(kEnglish),ru=FindLayout(kRussian);
+        for(wchar_t c=32;c<127;++c) {
+            const auto key=VkKeyScanExW(c,en);
+            Check(key!=-1,"printable ASCII has an installed US keyboard key");
+            if(key==-1)continue;
+            BYTE state[256]{};
+            if(HIBYTE(key)&1)state[VK_SHIFT]=state[VK_LSHIFT]=0x80;
+            wchar_t translated[4]{};
+            const auto vk=LOBYTE(key);
+            const auto scan=MapVirtualKeyExW(vk,MAPVK_VK_TO_VSC,en);
+            // Flag 4 queries without changing Windows' keyboard/dead-key state.
+            const auto read=ToUnicodeEx(vk,scan,state,translated,4,4,ru);
+            Check(read==1 && translated[0]==core::ConvertKey(c,core::Language::Russian),
+                "physical key conversion matches the installed Windows RU layout");
+        }
+    }
     {
         const DWORD clipboardBefore=GetClipboardSequenceNumber();
-        HWND edit=CreateWindowExW(0,L"EDIT",L"ghbdtn",ES_MULTILINE,0,0,100,30,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        HWND edit=CreateWindowExW(0,L"EDIT",L"ghbdtn",ES_MULTILINE,0,0,400,120,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         Check(edit!=nullptr,"isolated selected-text fixture created");
         if(edit) {
             SendMessageW(edit,EM_SETSEL,0,6);
@@ -1651,6 +1668,39 @@ int wmain(int argc, wchar_t** argv) {
             Check(start==0 && end==6,"replacement remains selected");
             Check(ConvertClassicSelection(edit,core::Language::Russian)==kSelectionEnglish,"repeat conversion restores original independently of keyboard");
             GetWindowTextW(edit,text,32);Check(std::wstring(text)==L"ghbdtn","round trip preserves selected content");
+            SetWindowTextW(edit,L"@#$^&|/");SendMessageW(edit,EM_SETSEL,0,-1);
+            Check(ConvertClassicSelection(edit,core::Language::Russian)==kSelectionRussian,"symbol-only selection uses explicit keyboard direction");
+            GetWindowTextW(edit,text,32);Check(std::wstring(text)==L"\"№;:?/.","shift digits and punctuation replace in real Edit");
+            Check(ConvertClassicSelection(edit,core::Language::English)==kSelectionEnglish,"symbol-only reverse conversion reports EN");
+            GetWindowTextW(edit,text,32);Check(std::wstring(text)==L"@#$^&|/","symbol-only real Edit round trip");
+            SetWindowTextW(edit,L"ghbdtn@ привет\"");SendMessageW(edit,EM_SETSEL,0,-1);
+            Check(ConvertClassicSelection(edit,core::Language::Russian)==kSelectionMixed,"mixed punctuation does not request a common language");
+            GetWindowTextW(edit,text,32);
+            if(std::wstring(text)!=L"привет\" ghbdtn@") {
+                std::printf("Owned mixed fixture code points:");
+                for(const auto c:std::wstring(text))std::printf(" %04X",static_cast<unsigned>(c));
+                std::printf("\n");
+            }
+            Check(std::wstring(text)==L"привет\" ghbdtn@","mixed words map all their key symbols");
+            SetWindowTextW(edit,L"1234567890");SendMessageW(edit,EM_SETSEL,0,-1);
+            Check(ConvertClassicSelection(edit,core::Language::Russian)==kSelectionMixed,"unchanged digit keys do not request language toggle");
+            SetWindowTextW(edit,L"ghbdtn");
+            SendMessageW(edit,EM_SETSEL,0,-1);SendMessageW(edit,EM_SETLIMITTEXT,3,0);
+            Check(FAILED(ConvertClassicSelection(edit,core::Language::Russian)),"truncated replacement is not a successful conversion");
+            GetWindowTextW(edit,text,32);Check(std::wstring(text)==L"ghbdtn","field exceeding its current limit is rejected before mutation");
+            SendMessageW(edit,EM_SETLIMITTEXT,65536,0);
+            static WNDPROC editProcedure=nullptr;
+            editProcedure=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(edit,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(
+                +[](HWND window,UINT message,WPARAM wp,LPARAM lp)->LRESULT {
+                    if(message==EM_REPLACESEL)CallWindowProcW(editProcedure,window,EM_SETLIMITTEXT,3,0);
+                    return CallWindowProcW(editProcedure,window,message,wp,lp);
+                })));
+            SendMessageW(edit,EM_SETSEL,0,-1);
+            const auto rejectedConversion=ConvertClassicSelection(edit,core::Language::Russian);
+            SetWindowLongPtrW(edit,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(editProcedure));
+            Check(FAILED(rejectedConversion),"native insertion truncated after preflight is reported as failure");
+            GetWindowTextW(edit,text,32);Check(std::wstring(text)==L"ghbdtn","rollback restores original when the control also limits undo");
+            SendMessageW(edit,EM_SETLIMITTEXT,65536,0);
             SendMessageW(edit,EM_SETSEL,2,2);
             Check(ConvertClassicSelection(edit,core::Language::Russian)==S_FALSE,"empty selection is a no-op");
             SendMessageW(edit,EM_SETSEL,0,6);SendMessageW(edit,EM_SETREADONLY,TRUE,0);

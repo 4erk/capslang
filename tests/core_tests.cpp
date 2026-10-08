@@ -20,6 +20,16 @@ int main() {
     InvertSelection(symbols.data(),symbols.size());
     InvertSelection(symbols.data(),symbols.size());
     check(symbols==originalSymbols,"mixed punctuation round trip");
+    check(ConvertKey(L'|',Language::Russian)==L'/' && ConvertKey(L'/',Language::English)==L'|',"shift backslash key maps both ways");
+    std::wstring signs=L"@#$^&|/ 123 !%*()_+\\";
+    check(InvertSelection(signs.data(),signs.size(),Language::Russian)==Language::Russian && signs==L"\"№;:?/. 123 !%*()_+\\","all punctuation uses keyboard direction when no letters");
+    check(InvertSelection(signs.data(),signs.size(),Language::English)==Language::English && signs==L"@#$^&|/ 123 !%*()_+\\","punctuation-only reverse conversion");
+    std::wstring punctuated=L"ghbdtn@ привет\"";
+    check(InvertSelection(punctuated.data(),punctuated.size(),Language::Russian)==Language::Unknown && punctuated==L"привет\" ghbdtn@","mixed words convert their punctuation and preserve common language");
+    std::wstring digits=L"1234567890";
+    check(InvertSelection(digits.data(),digits.size(),Language::Russian)==Language::Unknown && digits==L"1234567890","identical digit keys do not change language");
+    for(wchar_t c=32;c<127;++c)
+        check(ConvertKey(ConvertKey(c,Language::Russian),Language::English)==c,"every printable US key round trip");
     std::wstring english=L"Ghbdtn! 123\r\n🙂";
     check(InvertSelection(english.data(),english.size())==Language::Russian && english==L"Привет! 123\r\n🙂","direction comes from text");
     check(InvertSelection(english.data(),english.size())==Language::English && english==L"Ghbdtn! 123\r\n🙂","repeat restores selected text");

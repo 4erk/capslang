@@ -5,8 +5,8 @@ namespace capslang::core {
 constexpr std::uint32_t kSelectionEnglish=2,kSelectionRussian=3,kSelectionMixed=4;
 // Physical key correspondence, not transliteration. Unmapped Unicode survives.
 inline wchar_t ConvertKey(wchar_t value, Language destination) {
-    constexpr wchar_t en[] = L"`qwertyuiop[]asdfghjkl;'zxcvbnm,./~QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?@#$^&";
-    constexpr wchar_t ru[] = L"ёйцукенгшщзхъфывапролджэячсмитьбю.ЁЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,\"№;:?";
+    constexpr wchar_t en[] = L"`qwertyuiop[]asdfghjkl;'zxcvbnm,./~QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?@#$^&|";
+    constexpr wchar_t ru[] = L"ёйцукенгшщзхъфывапролджэячсмитьбю.ЁЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,\"№;:?/";
     static_assert(sizeof(en) == sizeof(ru), "paired physical key tables");
     if (!Supported(destination)) return value;
     const auto* from = destination == Language::Russian ? en : ru;
@@ -28,20 +28,28 @@ inline Language SelectionDestination(const wchar_t* text, std::size_t count) {
     }
     return en==ru ? Language::Unknown : en ? Language::Russian : Language::English;
 }
-inline Language InvertSelection(wchar_t* text,std::size_t count) {
-    const auto destination=SelectionDestination(text,count);
-    for(std::size_t i=0;i<count;++i) {
-        auto& c=text[i];
-        if(Supported(destination)) c=ConvertKey(c,destination);
-        else {
-            // Mixed text: swap pairs with a Russian letter endpoint. Other
-            // punctuation is ambiguous and remains unchanged, making this reversible.
-            const auto russian=ConvertKey(c,Language::Russian);
-            const auto english=ConvertKey(c,Language::English);
-            if(russian!=c && ((russian>=L'а'&&russian<=L'я')||(russian>=L'А'&&russian<=L'Я')||russian==L'ё'||russian==L'Ё'))c=russian;
-            else if((c>=L'а'&&c<=L'я')||(c>=L'А'&&c<=L'Я')||c==L'ё'||c==L'Ё')c=english;
+inline Language InvertSelection(wchar_t* text,std::size_t count,Language fallback=Language::Unknown) {
+    const auto selection=SelectionDestination(text,count);
+    bool anyLetters=false;
+    for(std::size_t i=0;i<count;++i)anyLetters |= Supported(SelectionDestination(text+i,1));
+    bool changed=false;
+    for(std::size_t start=0;start<count;) {
+        if(text[start]==L' '||text[start]==L'\t'||text[start]==L'\r'||text[start]==L'\n'){++start;continue;}
+        auto end=start;
+        while(end<count && text[end]!=L' ' && text[end]!=L'\t' && text[end]!=L'\r' && text[end]!=L'\n')++end;
+        auto destination=SelectionDestination(text+start,end-start);
+        if(!Supported(destination))destination=Supported(selection)?selection:fallback;
+        for(auto i=start;i<end;++i) {
+            auto direction=destination;
+            // A contiguous mixed-script token still swaps both alphabets.
+            const auto letterDirection=SelectionDestination(text+i,1);
+            if(!Supported(selection)&&Supported(letterDirection))direction=letterDirection;
+            const auto converted=ConvertKey(text[i],direction);
+            changed |= converted!=text[i];text[i]=converted;
         }
+        start=end;
     }
-    return destination;
+    return !changed ? Language::Unknown : Supported(selection)?selection:
+        anyLetters?Language::Unknown:fallback;
 }
 }

@@ -14,11 +14,11 @@ BEGIN
   BEGIN
    VALUE "CompanyName", "CapsLang contributors\0"
    VALUE "FileDescription", "CapsLang EN/RU synchronization - release candidate\0"
-   VALUE "FileVersion", "1.1.0-rc.2\0"
+   VALUE "FileVersion", "1.1.0-rc.3\0"
    VALUE "InternalName", "CapsLang\0"
    VALUE "OriginalFilename", "CapsLang.exe\0"
    VALUE "ProductName", "CapsLang\0"
-   VALUE "ProductVersion", "1.1.0-rc.2\0"
+   VALUE "ProductVersion", "1.1.0-rc.3\0"
   END
  END
  BLOCK "VarFileInfo"

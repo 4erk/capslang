@@ -7,10 +7,13 @@ if ($identity.User.Value -eq 'S-1-5-18' -or -not ([Security.Principal.WindowsPri
 $installed='C:\Program Files\CapsLang\CapsLang.exe'
 $probe='C:\Program Files\CapsLangDevProbe\CapsLang.exe'
 if ((Get-FileHash -LiteralPath $probe -Algorithm SHA256).Hash -ne $ExpectedHash) { throw 'Probe hash mismatch.' }
-if (Get-Service CapsLangLayout -ErrorAction SilentlyContinue) { throw 'Existing SYSTEM endpoint preserved.' }
+$service=Get-CimInstance Win32_Service -Filter "Name='CapsLangLayout'"
+if($service -and ($service.PathName -ne ('"'+$installed+'" --layout-service') -or $service.StartName -ne 'LocalSystem' -or $service.StartMode -ne 'Auto')) {throw 'Unexpected service preserved.'}
+$serviceWasRunning=$service -and $service.State -eq 'Running'
+$servicePaused=$false
 $before=(Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash
 $sid=$identity.User.Value
-$old=@(('CapsLang Engine '+$sid),('CapsLang Broker '+$sid)) | ForEach-Object {
+$old=@(('CapsLang Broker '+$sid),('CapsLang Engine '+$sid)) | ForEach-Object {
     $task=Get-ScheduledTask -TaskName $_
     if (@($task.Actions).Count -ne 1 -or $task.Actions[0].Execute -ne $installed) { throw 'Unexpected old role; preserved.' }
     $task
@@ -45,6 +48,7 @@ try {
     $ruleCreated=$true
     $paused=$true
     foreach($task in $old){Stop-ScheduledTask -InputObject $task}
+    if($serviceWasRunning){$servicePaused=$true;Stop-Service -Name CapsLangLayout; (Get-Service CapsLangLayout).WaitForStatus('Stopped',[TimeSpan]::FromSeconds(10))}
     Start-ScheduledTask -TaskName $names[0]
     Start-Sleep -Seconds 2
     Start-ScheduledTask -TaskName $names[1]
@@ -65,7 +69,8 @@ try {
     foreach($name in $registered){Stop-ScheduledTask -TaskName $name -ErrorAction Continue}
     foreach($name in $registered){Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Continue}
     if($ruleCreated){Remove-NetFirewallRule -Name $rule -ErrorAction Continue}
-    if($paused){foreach($task in $old){Start-ScheduledTask -InputObject $task}}
+    if($servicePaused){Start-Service -Name CapsLangLayout}
+    if($paused){foreach($task in @($old[1],$old[0])){Start-ScheduledTask -InputObject $task}}
     if((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne $before){throw 'Installed binary changed unexpectedly.'}
     foreach($file in $saved.Keys){if((Get-FileHash -LiteralPath (Join-Path $data $file) -Algorithm SHA256).Hash -ne $saved[$file]){throw ('Pair/identity changed: '+$file)}}
     Write-Output 'installed_binary_and_pair_preserved; old_roles_restarted; temporary_tasks_and_rule_removed'

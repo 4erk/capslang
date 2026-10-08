@@ -3,6 +3,7 @@
 #include "profile_attachment.hpp"
 #include "../platform/mwb_presence.hpp"
 #include "../core/keyboard.hpp"
+#include "../core/text_layout.hpp"
 #include <objbase.h>
 #include <wtsapi32.h>
 #include <atomic>
@@ -17,6 +18,7 @@ constexpr UINT kToggle = WM_APP + 21, kSet = WM_APP + 22, kManual = WM_APP + 23;
 constexpr UINT kStop = WM_APP + 24, kRehook = WM_APP + 25;
 constexpr UINT kConditionalSet = WM_APP + 26;
 constexpr UINT kProfile = WM_APP + 27, kProfileManual = WM_APP + 28;
+constexpr UINT kConvertSelection = WM_APP + 29;
 constexpr ULONG_PTR kLegacyInput = 0x434150534c414e47ULL, kLegacyProbe = 0x4341505350524f42ULL;
 constexpr wchar_t kEngineClass[] = L"CapsLang.Engine.1.1";
 constexpr wchar_t kRawClass[] = L"CapsLang.Engine.RawRelease.1.1";
@@ -66,6 +68,11 @@ struct Engine::Impl {
     std::atomic<unsigned> recoveryCount{0};
     core::KeyboardState keys;
     EngineOptions::CapsBatch capsStatus;
+    LayoutTarget conversionFocus{};
+    ULONGLONG conversionDeadline=0;
+    std::uint64_t conversionCommand=0;
+    std::uint64_t conversionGeneration=0;
+    core::Language conversionLanguage=core::Language::Unknown;
 #ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
     ProbeCapsCounters capsProbe;
 #endif
@@ -153,8 +160,12 @@ struct Engine::Impl {
         if (self->options.systemCaps) return next; // SYSTEM is the only Caps decision owner.
         const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         const auto decision = self->keys.Caps(Down(message) ? core::Edge::Down : core::Edge::Up,
-                                              shift, false, false, data.time);
+                                              shift, false, false, data.time,
+                                              (GetAsyncKeyState(VK_CONTROL)&0x8000)!=0,
+                                              (GetAsyncKeyState(VK_MENU)&0x8000)!=0,
+                                              ((GetAsyncKeyState(VK_LWIN)|GetAsyncKeyState(VK_RWIN))&0x8000)!=0);
         if (decision.toggle) PostMessageW(owner, kToggle, 0, static_cast<LPARAM>(SequenceStamp()));
+        if (decision.convert) PostMessageW(owner,kConvertSelection,0,static_cast<LPARAM>(SequenceStamp()));
 #ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
         if (decision.toggle) ++self->capsProbe.toggles;
 #endif
@@ -293,6 +304,31 @@ struct Engine::Impl {
             }
         }
         observed = static_cast<core::Language>(TargetLanguage(target));
+        if(conversionDeadline) {
+            const bool same=target.focus==conversionFocus.focus && target.threadId==conversionFocus.threadId && target.processId==conversionFocus.processId;
+            if(!same || profileSystem || now>conversionDeadline) {
+                conversionDeadline=0;conversionCommand=0;profileError=ERROR_CANCELLED;
+                profileAttachment.reset();nextProfileAttach=now;Publish();return;
+            }
+            if(profileAttachment) {
+                if(!conversionCommand)conversionCommand=profileAttachment->ConvertSelection(
+                    static_cast<LANGID>(conversionLanguage),layout.Generation(),target.focus,conversionDeadline);
+                const auto converted=profileAttachment->Take();
+                if(conversionCommand && converted.report.conversionCommand==conversionCommand) {
+                    const auto result=converted.report.conversionResult;
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+                    ProbeTrace("selection-result",target,result);
+#endif
+                    if((result==core::kSelectionEnglish || result==core::kSelectionRussian) && layout.Generation()==conversionGeneration)
+                        layout.Request(result==core::kSelectionEnglish?core::Language::English:core::Language::Russian,core::Origin::Manual,now);
+                    conversionDeadline=0;conversionCommand=0;
+                    profileAttachment.reset();nextProfileAttach=now;
+                    profileError=result==S_OK || result==S_FALSE || result==core::kSelectionEnglish ||
+                        result==core::kSelectionRussian || result==core::kSelectionMixed ? 0 : result;
+                }
+            }
+            Publish();return;
+        }
         if (profileAttachment || profileSystem) {
             const auto requestedGeneration = layout.Generation();
             const auto sample = profileAttachment ? profileAttachment->Take() :
@@ -358,7 +394,18 @@ struct Engine::Impl {
             if (!capsStatus.error && capsStatus.count <= 8) {
                 for (unsigned i = 0; i < capsStatus.count; ++i) {
                     intentOrder.Boundary(capsStatus.stamps[i]);
-                    layout.Toggle(GetTickCount64());
+                    if(capsStatus.convert[i]) {
+                        if(!conversionDeadline && !locked && core::Supported(layout.Target())) {
+                            conversionFocus=options.capture();conversionDeadline=GetTickCount64()+750;
+                            conversionLanguage=core::Opposite(layout.Target());conversionCommand=0;
+                            conversionGeneration=layout.Generation();
+#ifdef CAPSLANG_SYSTEM_PROFILE_PROBE
+                            ProbeTrace("selection-intent",conversionFocus,0);
+#endif
+                        }
+                    } else {
+                        layout.Toggle(GetTickCount64());
+                    }
                 }
             }
         }
@@ -469,6 +516,13 @@ struct Engine::Impl {
             if (!self->options.profileModule.empty()) self->intentOrder.Boundary(static_cast<std::uint64_t>(lp));
             self->manualUntil = 0; self->ownApplyUntil = now + 1500;
             self->layout.Toggle(now); self->Tick(); return 0;
+        case kConvertSelection:
+            if(!self->locked && !self->conversionDeadline && !self->options.profileModule.empty() && core::Supported(self->layout.Target())) {
+                self->conversionFocus=self->options.capture();self->conversionDeadline=now+750;
+                self->conversionLanguage=core::Opposite(self->layout.Target());self->conversionCommand=0;
+                self->conversionGeneration=self->layout.Generation();
+            }
+            self->Tick();return 0;
         case kConditionalSet:
             if (!self->options.profileModule.empty()) self->Tick();
             // A manual shortcut has reached the user thread but Windows may

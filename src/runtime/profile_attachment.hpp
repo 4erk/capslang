@@ -19,6 +19,9 @@ public:
     bool Start(const std::wstring& modulePath);
     void Stop();
     bool Request(LANGID language, std::uint64_t generation);
+    std::uint64_t ConvertSelection(LANGID language,std::uint64_t generation,HWND focus,ULONGLONG deadline) {
+        return hook_ ? host_.ConvertSelection(language,generation,focus,deadline) : 0;
+    }
     ProfileHost::Sample Take();
     DWORD Error() const;
     std::uint64_t Binding() const { return host_.Binding(); }

@@ -3,7 +3,7 @@
 
 namespace capslang::core {
 enum class Edge { Down, Up };
-struct KeyResult { bool suppress = false; bool toggle = false; };
+struct KeyResult { bool suppress = false; bool toggle = false; bool convert = false; };
 
 // Owned solely by the hook thread. No OS calls, I/O, allocations or waits.
 // The caller invokes the remainder of the hook chain first. Events forwarded
@@ -11,14 +11,14 @@ struct KeyResult { bool suppress = false; bool toggle = false; };
 class KeyboardState {
 public:
     KeyResult Caps(Edge edge, bool shift, bool own, bool consumedDownstream,
-                   std::uint32_t eventTime = 0) {
+                   std::uint32_t eventTime = 0, bool control = false, bool alt = false, bool win = false) {
         if (own || consumedDownstream) return {};
         if (edge == Edge::Down) {
             downTime_ = eventTime;
             if (held_) return {!pass_, false};
             held_ = true;
-            pass_ = shift;
-            return {!pass_, !pass_};
+            pass_ = shift || (control && (alt || win));
+            return {!pass_, !pass_ && !control, !pass_ && control};
         }
         // An orphan up is not ours to suppress (e.g. startup during a press).
         const bool suppress = held_ && !pass_;

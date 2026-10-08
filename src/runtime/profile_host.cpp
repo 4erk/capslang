@@ -110,6 +110,7 @@ bool ProfileHost::Request(LANGID language, std::uint64_t generation) {
     if (generation == self.command.generation) return true;
     if (self.command.command == UINT64_MAX) return false;
     ++self.command.command; self.command.operation = pc::Operation::Apply;
+    self.command.focus = self.command.deadline = 0;
     self.command.language = language; self.command.generation = generation;
     self.highestGeneration = generation;
     self.sample.confirmed = false; return true;
@@ -121,7 +122,18 @@ bool ProfileHost::Detach() {
     if (self.command.operation != pc::Operation::Detach) ++self.command.command;
     self.command.operation = pc::Operation::Detach;
     self.command.language = 0; self.command.generation = 0; self.sample.confirmed = false;
+    self.command.focus = self.command.deadline = 0;
     return true;
+}
+std::uint64_t ProfileHost::ConvertSelection(LANGID language,std::uint64_t generation,HWND focus,ULONGLONG deadline) {
+    auto& self=*impl_;std::lock_guard<std::mutex> lock(self.mutex);
+    DWORD pid=0;const auto tid=GetWindowThreadProcessId(focus,&pid);
+    if(!self.ready || !self.Alive() || !pc::Language(language) || !generation ||
+        pid!=self.process || tid!=self.thread || deadline<=GetTickCount64() || self.command.command==UINT64_MAX) return 0;
+    ++self.command.command;self.command.operation=pc::Operation::ConvertSelection;
+    self.command.language=language;self.command.generation=generation;
+    self.command.focus=reinterpret_cast<ULONG_PTR>(focus);self.command.deadline=deadline;
+    return self.command.command;
 }
 ProfileHost::Sample ProfileHost::Take() {
     auto& self = *impl_;

@@ -40,7 +40,7 @@ private:
 inline void ProbeTrace(const char* stage, const LayoutTarget& target, DWORD error) {
     static thread_local ULONGLONG previous = 0;
     const auto now = GetTickCount64();
-    if (now - previous < 500) return;
+    if (now - previous < 500 && strncmp(stage,"selection-",10)!=0) return;
     previous = now;
     DWORD pathError = 0;
     auto path = app::InstalledExecutable(pathError);

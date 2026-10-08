@@ -1,4 +1,5 @@
 #include "thread_profile.hpp"
+#include "selection_edit.hpp"
 #include <limits>
 #include <new>
 
@@ -235,4 +236,26 @@ HRESULT ThreadProfile::Bind() { return impl_->Bind(); }
 HRESULT ThreadProfile::Unbind() { return impl_->Unbind(); }
 ThreadProfile::Result ThreadProfile::Read() { return impl_->Read(); }
 ThreadProfile::Result ThreadProfile::Apply(LANGID language, std::uint64_t generation) { return impl_->Apply(language, generation); }
+HRESULT ThreadProfile::ConvertSelection(LANGID destination) {
+    if(!impl_->SameThread() || !Supported(destination)) return E_INVALIDARG;
+    HWND focus=GetFocus();
+    if(!focus || GetWindowThreadProcessId(GetForegroundWindow(),nullptr)!=GetCurrentThreadId())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    auto result=ConvertClassicSelection(focus,static_cast<core::Language>(destination));
+    if(result!=E_NOTIMPL)return result;
+    if(!impl_->thread)return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    ITfDocumentMgr* document=nullptr;ITfContext* context=nullptr;
+    result=impl_->thread->GetFocus(&document);
+    if(SUCCEEDED(result)&&document)result=document->GetTop(&context);
+    if(document)document->Release();
+    if(FAILED(result)||!context)return FAILED(result)?result:E_NOTIMPL;
+    TfClientId client=0;
+    result=impl_->thread->Activate(&client);
+    if(SUCCEEDED(result)) {
+        auto* edit=new(std::nothrow) SelectionEdit(context,static_cast<core::Language>(destination),focus);
+        if(edit){HRESULT session=E_PENDING;result=context->RequestEditSession(client,edit,TF_ES_SYNC|TF_ES_READWRITE,&session);edit->Release();if(SUCCEEDED(result))result=session;}
+        else result=E_OUTOFMEMORY;
+        impl_->thread->Deactivate();
+    }
+    context->Release();return result;
+}
 } // namespace capslang

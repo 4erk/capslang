@@ -137,7 +137,7 @@ if ($MessageProbeOnly) {
         (Join-Path $projectRoot 'src\runtime\profile_peer.cpp') `
         (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
         (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
-        '-o' (Join-Path $probeOutput 'layout_message_probe.dll') '-luser32' '-lole32' '-luuid' '-ladvapi32'
+        '-o' (Join-Path $probeOutput 'layout_message_probe.dll') '-luser32' '-lole32' '-loleaut32' '-luuid' '-ladvapi32'
     if ($LASTEXITCODE -ne 0) { throw 'Message observation DLL compilation failed.' }
     foreach ($moduleKind in @('test','production')) {
         $moduleDefines = @()
@@ -152,7 +152,7 @@ if ($MessageProbeOnly) {
             (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
             (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
             (Join-Path $projectRoot 'src\app\paths.cpp') `
-            '-o' (Join-Path $probeOutput $moduleName) '-luser32' '-lole32' '-luuid' '-ladvapi32' '-lshell32' '-lbcrypt'
+            '-o' (Join-Path $probeOutput $moduleName) '-luser32' '-lole32' '-loleaut32' '-luuid' '-ladvapi32' '-lshell32' '-lbcrypt'
         if ($LASTEXITCODE -ne 0) { throw "Profile module compilation failed: $moduleKind" }
     }
     $probeExe = Join-Path $probeOutput 'windows_message_probe.exe'
@@ -199,7 +199,7 @@ if ($AppDevOnly -or $Release -or $SystemProfileProbeOnly) {
             (Join-Path $projectRoot 'src\runtime\local_ipc.cpp') `
             (Join-Path $projectRoot 'src\platform\windows_support.cpp') `
             (Join-Path $projectRoot 'src\app\paths.cpp') `
-            '-o' $moduleDll '-luser32' '-lole32' '-luuid' '-ladvapi32' '-lshell32' '-lbcrypt'
+            '-o' $moduleDll '-luser32' '-lole32' '-loleaut32' '-luuid' '-ladvapi32' '-lshell32' '-lbcrypt'
         if ($LASTEXITCODE -ne 0) { throw "Production profile module compilation failed: $architecture" }
         $resourceId = if ($architecture -eq '64') { 4101 } else { 4102 }
         $moduleResources.Add(('{0} RCDATA "{1}"' -f $resourceId, $moduleDll.Replace('\','/')))

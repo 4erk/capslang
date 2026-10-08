@@ -13,6 +13,8 @@ struct Update {
     pc::Event notification{};
     std::uint64_t command = 0;
     ThreadProfile::Result result{};
+    bool conversion = false;
+    HRESULT conversionResult = E_PENDING;
 };
 struct Inbox {
     pc::Command command{};
@@ -54,6 +56,7 @@ void Worker(std::shared_ptr<Transport> state) noexcept {
                     report.profile = pc::Language(update.result.profile) ? update.result.profile : 0;
                     report.error = static_cast<DWORD>(update.result.error);
                     report.sampled = update.result.sampled;
+                    if(update.conversion){report.conversionCommand=update.command;report.conversionResult=static_cast<DWORD>(update.conversionResult);}
                 }
             }
             if (state->lost) { report.error = ERROR_MORE_DATA; report.confirmedGeneration = 0; }
@@ -71,7 +74,8 @@ void Worker(std::shared_ptr<Transport> state) noexcept {
             const auto sentThrough = report.count ? report.events[report.count - 1].serial : acknowledged;
             if (reply.eventsThrough < acknowledged || reply.eventsThrough > sentThrough || reply.command < delivered ||
                 (reply.command == delivered && (reply.operation != previous.operation ||
-                 reply.language != previous.language || reply.generation != previous.generation))) break;
+                 reply.language != previous.language || reply.generation != previous.generation ||
+                 reply.focus != previous.focus || reply.deadline != previous.deadline))) break;
             acknowledged = reply.eventsThrough;
             std::size_t retained = 0;
             for (std::size_t i = 0; i < report.count; ++i)
@@ -102,6 +106,8 @@ struct ProfilePeer::Impl {
     ThreadProfile profile;
     bool started = false, detached = false;
     std::uint64_t processed = 0;
+    std::uint64_t converted = 0;
+    HRESULT conversionResult = E_PENDING;
     Impl(ipc::Endpoint endpoint, std::uint64_t binding, std::wstring server, bool high)
         : state(std::make_shared<Transport>(std::move(endpoint), binding, std::move(server), high)),
           profile(Notify, state.get(), nullptr, true, true) {}
@@ -157,6 +163,18 @@ void ProfilePeer::Step() {
         }
         if (self.detached) { result.error = HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED); self.Send(command.command, result); continue; }
         result.error = self.profile.Bind();
+        if(command.operation==pc::Operation::ConvertSelection) {
+            if(command.command!=self.converted) {
+                self.converted=command.command;
+                self.conversionResult=FAILED(result.error)?result.error:
+                    (GetTickCount64()>command.deadline || reinterpret_cast<ULONG_PTR>(GetFocus())!=command.focus ?
+                     HRESULT_FROM_WIN32(ERROR_CANCELLED) : self.profile.ConvertSelection(static_cast<LANGID>(command.language)));
+            }
+            Update update;update.command=command.command;update.result=self.profile.Read();
+            update.conversion=true;update.conversionResult=self.conversionResult;
+            if(!state.outgoing.TryPush(update))state.lost=true;
+            continue;
+        }
         if (SUCCEEDED(result.error)) result = request.apply ?
             self.profile.Apply(static_cast<LANGID>(command.language), command.generation) : self.profile.Read();
         self.Send(command.command, result);

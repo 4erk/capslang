@@ -1,5 +1,6 @@
 #include "../src/core/keyboard.hpp"
 #include "../src/core/layout.hpp"
+#include "../src/core/text_layout.hpp"
 #include <cstdio>
 #include <initializer_list>
 
@@ -7,6 +8,32 @@ using namespace capslang::core;
 int main() {
     unsigned checks = 0, failed = 0;
     auto check = [&](bool ok, const char* name) { ++checks; if (!ok) { ++failed; std::printf("FAIL %s\n", name); } };
+    check(ConvertText(L"ghbdtn",Language::Russian)==L"привет", "selection EN to RU");
+    check(ConvertText(L"руддщ",Language::English)==L"hello", "selection RU to EN");
+    check(ConvertText(L"Ghbdtn! 123\r\n🙂",Language::Russian)==L"Привет! 123\r\n🙂", "case whitespace Unicode preserved");
+    std::wstring mixed=L"ghbdtn привет";
+    check(InvertSelection(mixed.data(),mixed.size())==Language::Unknown && mixed==L"привет ghbdtn","mixed selection swaps both languages");
+    InvertSelection(mixed.data(),mixed.size());
+    check(mixed==L"ghbdtn привет","mixed selection round trip");
+    std::wstring symbols=L"hello привет []{};'\".,/№@#$^&?:🙂";
+    const auto originalSymbols=symbols;
+    InvertSelection(symbols.data(),symbols.size());
+    InvertSelection(symbols.data(),symbols.size());
+    check(symbols==originalSymbols,"mixed punctuation round trip");
+    std::wstring english=L"Ghbdtn! 123\r\n🙂";
+    check(InvertSelection(english.data(),english.size())==Language::Russian && english==L"Привет! 123\r\n🙂","direction comes from text");
+    check(InvertSelection(english.data(),english.size())==Language::English && english==L"Ghbdtn! 123\r\n🙂","repeat restores selected text");
+    for (const wchar_t c : std::wstring(L"qwerty[];'zxcvbnm,./QWERTY{}:\"<>?@#$^&"))
+        check(ConvertKey(ConvertKey(c,Language::Russian),Language::English)==c,"physical-key round trip");
+    KeyboardState conversionKeys;
+    auto selectionDown=conversionKeys.Caps(Edge::Down,false,false,false,1,true);
+    check(selectionDown.suppress && selectionDown.convert && !selectionDown.toggle,"Ctrl Caps requests conversion only");
+    auto selectionRepeat=conversionKeys.Caps(Edge::Down,false,false,false,2,true);
+    check(selectionRepeat.suppress && !selectionRepeat.convert && !selectionRepeat.toggle,"conversion hold has no repeat");
+    check(conversionKeys.Caps(Edge::Up,false,false,false,3,false).suppress,"conversion up remains suppressed after Ctrl release");
+    check(!conversionKeys.Caps(Edge::Down,true,false,false,4,true).suppress,"Ctrl Shift Caps retains ordinary Caps");
+    conversionKeys.Caps(Edge::Up,true,false,false,5,true);
+    check(!conversionKeys.Caps(Edge::Down,false,false,false,6,true,true).convert,"AltGr not conversion");
     for (const bool injected : {false, true}) {
         // Injection origin intentionally does not exclude MWB keyboard input.
         (void)injected;

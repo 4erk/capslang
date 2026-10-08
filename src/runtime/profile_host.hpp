@@ -29,6 +29,7 @@ public:
     bool Start();
     void Stop();
     bool Request(LANGID language, std::uint64_t generation);
+    std::uint64_t ConvertSelection(LANGID language, std::uint64_t generation, HWND focus, ULONGLONG deadline);
     bool Detach();
     Sample Take();
     ipc::Endpoint Endpoint() const;

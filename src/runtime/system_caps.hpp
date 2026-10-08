@@ -46,10 +46,13 @@ class Server {
         if (!down && !up) return next;
         if (down && (!self->desktopAllowed || GetTickCount64() - self->lease.load() > 1500 || self->hookError || self->deliveryError)) return next;
         const auto decision = self->keys.Caps(down ? core::Edge::Down : core::Edge::Up,
-            (GetAsyncKeyState(VK_SHIFT)&0x8000)!=0,false,false,data.time);
-        if (decision.toggle) {
+            (GetAsyncKeyState(VK_SHIFT)&0x8000)!=0,false,false,data.time,
+            (GetAsyncKeyState(VK_CONTROL)&0x8000)!=0,(GetAsyncKeyState(VK_MENU)&0x8000)!=0,
+            ((GetAsyncKeyState(VK_LWIN)|GetAsyncKeyState(VK_RWIN))&0x8000)!=0);
+        if (decision.toggle || decision.convert) {
             LARGE_INTEGER stamp{}; QueryPerformanceCounter(&stamp);
-            if (self->produced == UINT64_MAX || !self->queue.TryPush({++self->produced,static_cast<std::uint64_t>(stamp.QuadPart)}))
+            if (self->produced == UINT64_MAX || !self->queue.TryPush({++self->produced,static_cast<std::uint64_t>(stamp.QuadPart),
+                decision.convert ? Action::ConvertSelection : Action::Toggle}))
                 self->deliveryError = ERROR_MORE_DATA;
             self->producedSnapshot = self->produced;
         }

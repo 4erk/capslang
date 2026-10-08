@@ -42,6 +42,7 @@ public:
     // during a reentrant COM call. Installed peers request desktop-wide profile
     // activation; standalone observers default to thread scope. No synthetic input.
     Result Apply(LANGID language, std::uint64_t generation);
+    HRESULT ConvertSelection(LANGID destination);
 private:
     struct Impl;
     Impl* impl_;

@@ -7,10 +7,10 @@ namespace capslang::profile_channel {
 // Local module <-> elevated engine messages. This is NOT the peer/LAN protocol.
 // Transport must authenticate SID, session, protected server image and the
 // pinned process incarnation in BOTH directions before using these records.
-constexpr std::uint32_t kMagic = 0x504f4c43, kVersion = 2;
+constexpr std::uint32_t kMagic = 0x504f4c43, kVersion = 4;
 constexpr std::size_t kBatch = 8;
 enum class Cause : std::uint32_t { Baseline = 0, OwnRequest = 1, Observed = 2 };
-enum class Operation : std::uint32_t { Observe = 1, Apply = 2, Detach = 3 };
+enum class Operation : std::uint32_t { Observe = 1, Apply = 2, Detach = 3, ConvertSelection = 4 };
 constexpr bool Language(std::uint32_t language) { return language == 0x0409 || language == 0x0419; }
 #pragma pack(push, 1)
 struct Event {
@@ -26,6 +26,8 @@ struct Report {
     std::uint64_t processedCommand = 0, confirmedGeneration = 0;
     std::uint64_t sampled = 0; // GetTickCount64 on the host UI thread, not IPC heartbeat.
     std::uint32_t actual = 0, profile = 0, error = 0, count = 0;
+    std::uint64_t conversionCommand = 0;
+    std::uint32_t conversionResult = 0;
     std::array<Event, kBatch> events{};
 };
 struct Command {
@@ -34,9 +36,10 @@ struct Command {
     Operation operation = Operation::Observe;
     std::uint32_t language = 0;
     std::uint64_t generation = 0, eventsThrough = 0;
+    std::uint64_t focus = 0, deadline = 0;
 };
 #pragma pack(pop)
-static_assert(sizeof(Event) == 32 && sizeof(Report) == 328 && sizeof(Command) == 56,
+static_assert(sizeof(Event) == 32 && sizeof(Report) == 340 && sizeof(Command) == 72,
               "identical fixed ABI for x64 and x86; no pointers/HKL/text");
 inline bool Empty(const Event& event) {
     return !event.serial && !event.generation && !event.language && !event.occurred && event.cause == Cause::Observed;
@@ -54,6 +57,7 @@ inline bool Valid(const Report& report, std::uint64_t binding, std::uint32_t pid
         !pid || !tid || report.process != pid || report.thread != tid || !report.poll || report.count > kBatch)
         return false;
     if ((report.actual && !Language(report.actual)) || (report.profile && !Language(report.profile))) return false;
+    if (report.conversionCommand>report.processedCommand || (!report.conversionCommand && report.conversionResult)) return false;
     if (!report.error && (!report.sampled || !Language(report.actual) || !Language(report.profile))) return false;
     if (report.confirmedGeneration && (!report.processedCommand || report.error || report.actual != report.profile))
         return false;
@@ -67,8 +71,9 @@ inline bool Valid(const Command& command, std::uint64_t binding, std::uint64_t p
     if (command.magic != kMagic || command.version != kVersion || !binding || command.binding != binding ||
         !poll || command.poll != poll || !command.command) return false;
     switch (command.operation) {
-    case Operation::Observe: case Operation::Detach: return !command.language && !command.generation;
-    case Operation::Apply: return Language(command.language) && command.generation;
+    case Operation::Observe: case Operation::Detach: return !command.language && !command.generation && !command.focus && !command.deadline;
+    case Operation::Apply: return Language(command.language) && command.generation && !command.focus && !command.deadline;
+    case Operation::ConvertSelection: return Language(command.language) && command.generation && command.focus && command.deadline;
     default: return false;
     }
 }

@@ -2,7 +2,7 @@
 #include "profile_channel.hpp"
 
 namespace capslang::system_profile {
-constexpr std::uint32_t kMagic = 0x53545043, kVersion = 1;
+constexpr std::uint32_t kMagic = 0x53545043, kVersion = 2;
 enum class Operation : std::uint32_t { Apply = 1, Release = 2 };
 #pragma pack(push, 1)
 struct Request {
@@ -18,7 +18,7 @@ struct Response {
     profile_channel::Report report{};
 };
 #pragma pack(pop)
-static_assert(sizeof(Request) == 56 && sizeof(Response) == 360, "fixed SYSTEM profile ABI; no paths or input data");
+static_assert(sizeof(Request) == 56 && sizeof(Response) == 372, "fixed SYSTEM profile ABI; no paths or input data");
 inline bool Valid(const Request& value) {
     if (value.magic != kMagic || value.version != kVersion || !value.id || !value.epoch ||
         (!value.binding && value.eventsThrough)) return false;
@@ -36,7 +36,8 @@ inline bool Valid(const Response& value, const Request& request) {
         if (!value.error && request.operation != Operation::Release) return false;
         if (report.magic != profile_channel::kMagic || report.version != profile_channel::kVersion ||
             report.poll || report.process || report.thread || report.processedCommand ||
-            report.confirmedGeneration || report.sampled || report.actual || report.profile || report.error || report.count)
+            report.confirmedGeneration || report.sampled || report.actual || report.profile || report.error || report.count ||
+            report.conversionCommand || report.conversionResult)
             return false;
         for (const auto& event : report.events) if (!profile_channel::Empty(event)) return false;
         return true;

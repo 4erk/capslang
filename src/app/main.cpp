@@ -151,7 +151,10 @@ int Main(const std::vector<std::wstring> &args) {
             EngineOptions::CapsBatch batch;
             batch.error = result.error; batch.heartbeat = result.heartbeat; batch.recoveries = result.recoveries;
             batch.count = result.count;
-            for (unsigned i = 0; i < result.count && i < 8; ++i) batch.stamps[i] = result.events[i].stamp;
+            for (unsigned i = 0; i < result.count && i < 8; ++i) {
+                batch.stamps[i] = result.events[i].stamp;
+                batch.convert[i] = result.events[i].action == system_caps::Action::ConvertSelection;
+            }
             return batch;
         };
         EngineHost host(ipc::Endpoint::Current(), options);

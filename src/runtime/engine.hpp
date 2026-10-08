@@ -28,6 +28,7 @@ struct EngineOptions {
         std::uint64_t heartbeat = 0, recoveries = 0;
         unsigned count = 0;
         std::uint64_t stamps[8]{};
+        bool convert[8]{};
     };
     // Test dependency supplied by code, not by CLI or IPC. Default uses the
     // foreground target. It cannot be set by a lower-privileged external client.

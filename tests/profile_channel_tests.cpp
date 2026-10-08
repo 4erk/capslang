@@ -11,6 +11,19 @@ int main() {
     report.actual = report.profile = 0x0409;
     const auto valid = [](const Report& value) { return Valid(value, 7, 8, 9); };
     Check(valid(report), "unconfirmed observation can be read without claiming application");
+    auto conversionReport=report;conversionReport.conversionCommand=1;
+    Check(!valid(conversionReport),"future conversion acknowledgment rejected");
+    conversionReport.processedCommand=1;
+    Check(valid(conversionReport),"conversion outcome tied to processed command");
+    conversionReport.conversionCommand=0;conversionReport.conversionResult=5;
+    Check(!valid(conversionReport),"orphan conversion result rejected");
+    Command conversion;conversion.binding=7;conversion.poll=1;conversion.command=1;
+    conversion.operation=Operation::ConvertSelection;conversion.language=0x419;conversion.generation=1;
+    Check(!Valid(conversion,7,1),"selection command requires pinned focus and expiry");
+    conversion.focus=10;conversion.deadline=100;
+    Check(Valid(conversion,7,1),"bounded fixed selection command accepted");
+    conversion.operation=Operation::Apply;
+    Check(!Valid(conversion,7,1),"selection fields cannot leak into ordinary language operation");
     for (auto language : {0U, 0x407U, 0x10409U, UINT32_MAX}) {
         auto bad = report; bad.actual = language; Check(!valid(bad), "actual language must be exact EN/RU");
         bad = report; bad.profile = language; Check(!valid(bad), "profile language must be exact EN/RU");

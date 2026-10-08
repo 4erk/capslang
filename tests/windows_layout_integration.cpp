@@ -9,6 +9,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "../src/runtime/selection_edit.hpp"
 #ifdef CAPSLANG_PROFILE_ENGINE
 #include <atomic>
 #include "../src/runtime/engine.hpp"
@@ -1637,6 +1638,29 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    {
+        const DWORD clipboardBefore=GetClipboardSequenceNumber();
+        HWND edit=CreateWindowExW(0,L"EDIT",L"ghbdtn",ES_MULTILINE,0,0,100,30,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        Check(edit!=nullptr,"isolated selected-text fixture created");
+        if(edit) {
+            SendMessageW(edit,EM_SETSEL,0,6);
+            Check(ConvertClassicSelection(edit,core::Language::English)==kSelectionRussian,"selected EN text converts to RU independently of keyboard");
+            wchar_t text[32]{};GetWindowTextW(edit,text,32);
+            Check(std::wstring(text)==L"привет","real Edit content changed by physical layout mapping");
+            DWORD start=0,end=0;SendMessageW(edit,EM_GETSEL,reinterpret_cast<WPARAM>(&start),reinterpret_cast<LPARAM>(&end));
+            Check(start==0 && end==6,"replacement remains selected");
+            Check(ConvertClassicSelection(edit,core::Language::Russian)==kSelectionEnglish,"repeat conversion restores original independently of keyboard");
+            GetWindowTextW(edit,text,32);Check(std::wstring(text)==L"ghbdtn","round trip preserves selected content");
+            SendMessageW(edit,EM_SETSEL,2,2);
+            Check(ConvertClassicSelection(edit,core::Language::Russian)==S_FALSE,"empty selection is a no-op");
+            SendMessageW(edit,EM_SETSEL,0,6);SendMessageW(edit,EM_SETREADONLY,TRUE,0);
+            Check(ConvertClassicSelection(edit,core::Language::Russian)==E_ACCESSDENIED,"read-only text is not edited");
+            SendMessageW(edit,EM_SETREADONLY,FALSE,0);SendMessageW(edit,EM_SETPASSWORDCHAR,L'*',0);
+            Check(ConvertClassicSelection(edit,core::Language::Russian)==E_ACCESSDENIED,"masked text is not read or edited");
+            Check(GetClipboardSequenceNumber()==clipboardBefore,"conversion never changes clipboard");
+            DestroyWindow(edit);
+        }
+    }
     if (SUCCEEDED(com) && FindLayout(kEnglish) && FindLayout(kRussian)) {
 #ifdef CAPSLANG_ENGINE_INTEGRATION
         // Diagnostic A/B only: defaults retain the full regression suite.
